@@ -2,7 +2,7 @@
 
 Post-process pre-trained predictors to satisfy demographic parity.
 
-Implemented in `postprocess.py`.  Notebooks `adult.ipynb`, `biosbias.ipynb` and `communities.ipynb` contain code for reproducing the results in our paper:
+Implemented in `postprocess.py`.  Notebooks `adult.ipynb`, `biasbios.ipynb` and `communities.ipynb` contain code for reproducing the results in our paper:
 
 ```bibtex
 @misc{xian2022FairOptimalClassification,
