@@ -1,8 +1,8 @@
 # Fair Classification
 
-Post-process pre-trained predictors to satisfy demographic parity.
+Post-process pre-trained predictors for satisfying demographic parity.
 
-Implemented in `postprocess.py`.  Notebooks `adult.ipynb`, `biasbios.ipynb` and `communities.ipynb` contain code for reproducing the results in our paper:
+Implemented in `postprocess.py`.  Notebooks `adult.ipynb`, `biasbios.ipynb` and `communities.ipynb` contain the code for reproducing the results in our paper:
 
 ```bibtex
 @misc{xian2022FairOptimalClassification,
