@@ -283,13 +283,9 @@ class PostProcessorDP(BaseEstimator):
     #     np.zeros(self.n_classes_),
     #     A_ub=A_ubs,
     #     b_ub=b_ubs,
-    #     # A_eq=np.ones((1, self.n_classes_)),
-    #     # b_eq=[1],
     #     bounds=None,
     #     method="highs")
-    # Do projection instead of enforcing equality constraints, due to numerical
-    # imprecisions
-    # z = res.x - (res.x.sum() - 1) / self.n_classes_
+    # z = res.x
 
     ## `cvxopt.solvers.qp` implementation
     h = matrix(b_ubs.reshape(-1, 1))
@@ -299,16 +295,12 @@ class PostProcessorDP(BaseEstimator):
                  size=(rows, self.n_classes_))
     P = -1.0 / 2.0 * (G.T * G)
     q = 2.0 * G.T * h
-    A = matrix(np.ones((1, self.n_classes_)))
-    b = matrix(1.0)
 
     with redirect_stdout(io.StringIO()):
       sol = solvers.qp(P,
                        q,
                        G,
                        h,
-                       A,
-                       b,
                        kktsolver="ldl",
                        options={"kktreg": 1e-9})
     z = np.array(sol["x"]).squeeze()
