@@ -99,7 +99,7 @@ class PostProcessorDP(BaseEstimator):
     a_max = np.argmax(n_examples)
 
     offset_barycenter = sum(n_examples) * self.n_classes_
-    offset_q = offset_barycenter * self.n_classes_
+    offset_q = offset_barycenter + self.n_classes_
     offset_slacks = offset_q + self.n_groups_ * self.n_classes_
     n_designs = offset_slacks + self.n_groups_ * self.n_classes_
 
@@ -242,7 +242,8 @@ class PostProcessorDP(BaseEstimator):
     for a in range(self.n_groups_):
       this_gamma = x[offset:offset + n_examples[a] * self.n_classes_]
       gammas.append(this_gamma.reshape((n_examples[a], self.n_classes_)))
-      this_cost = c[offset:offset + n_examples[a] * self.n_classes_]
+      this_cost = c[offset:offset + n_examples[a] *
+                    self.n_classes_] * n_examples[a] / n_examples[a_max]
       cost += np.sum(this_gamma / np.sum(this_gamma) * this_cost)
       offset += n_examples[a] * self.n_classes_
     if w is None:
