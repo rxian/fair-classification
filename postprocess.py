@@ -1,11 +1,9 @@
-from contextlib import redirect_stdout
-import io
 from itertools import chain
 
-from cvxopt import matrix, spmatrix, solvers
 import numpy as np
-import scipy
+from qpsolvers import solve_ls
 from scipy.optimize import linprog
+from scipy.sparse import csc_matrix
 from sklearn.base import BaseEstimator
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 
@@ -63,28 +61,30 @@ class PostProcessorDP(BaseEstimator):
         p[groups == i] / np.sum(p[groups == i]) for i in range(self.n_groups_)
     ]
 
-    gammas, cost, barycenter = self.find_barycenter_and_kantorovich_transports_(
+    gammas_unnormalized, cost, barycenter = self.linprog_dp_(
         probas_by_group,
         eps=eps,
         w=w,
         p_by_group=p_by_group,
         q_by_group=q_by_group)
     self.score_ = cost
-    self.gamma_by_group_ = gammas
+    self.gamma_by_group_ = [
+        gamma / gamma.sum() for gamma in gammas_unnormalized
+    ]
     self.barycenter_ = barycenter
-    self.q_by_group_ = [gamma.sum(axis=0) / gamma.sum() for gamma in gammas]
+    self.q_by_group_ = [gamma.sum(axis=0) for gamma in self.gamma_by_group_]
     self.psi_by_group_ = np.stack([
-        self.extract_monge_transport_(probas_by_group[i], gammas[i])
+        self.find_point_(probas_by_group[i], gammas_unnormalized[i])
         for i in range(self.n_groups_)
     ])
     return self
 
-  def find_barycenter_and_kantorovich_transports_(self,
-                                                  probas_by_group,
-                                                  eps=0.0,
-                                                  w=None,
-                                                  p_by_group=None,
-                                                  q_by_group=None):
+  def linprog_dp_(self,
+                  probas_by_group,
+                  eps=0.0,
+                  w=None,
+                  p_by_group=None,
+                  q_by_group=None):
     """Find barycenter and Kantorovich simplex-vertex transports of each group.
        Implements the OPT linear program in the paper."""
 
@@ -93,14 +93,14 @@ class PostProcessorDP(BaseEstimator):
     #
     # They are flattened into a single vector, which when unraveled is a 3d
     # tensor of shape (n_groups, n_examples, n_classes), followed by a vector of
-    # shape (n_classes,), and two 2d tensors of shape (n_groups, n_classes).
+    # length (n_classes,), and two 2d tensors of shape (n_groups, n_classes).
 
     n_examples = [len(probas) for probas in probas_by_group]
     a_max = np.argmax(n_examples)
 
     offset_barycenter = sum(n_examples) * self.n_classes_
-    offset_q = offset_barycenter + self.n_classes_
-    offset_slacks = offset_q + self.n_groups_ * self.n_classes_
+    offset_qs = offset_barycenter + self.n_classes_
+    offset_slacks = offset_qs + self.n_groups_ * self.n_classes_
     n_designs = offset_slacks + self.n_groups_ * self.n_classes_
 
     def ravel_index(multi_index):
@@ -116,7 +116,7 @@ class PostProcessorDP(BaseEstimator):
       return [int(x) for x in indices]
 
     # l_1 transportation costs
-    c = []
+    q = []
     for a in range(self.n_groups_):
       s = np.repeat(np.arange(n_examples[a]), self.n_classes_, axis=0)
       y = np.tile(np.arange(self.n_classes_), n_examples[a])
@@ -125,186 +125,163 @@ class PostProcessorDP(BaseEstimator):
         costs *= w[a]
       # Normalize, due to the upscaling (see implementation below)
       costs *= n_examples[a_max] / n_examples[a]
-      c.extend(costs)
-    c = np.array(c)
+      q.extend(costs)
+    q = np.array(q)
 
     # Get constraints
-    A_ubs_sparse_i = []
-    A_ubs_sparse_j = []
-    A_ubs_sparse_v = []
-    b_ubs = []
-    row_ubs = 0
+    G_i = []
+    G_j = []
+    G_v = []
+    G_rows = 0
+    h = []
 
-    A_eqs_sparse_i = []
-    A_eqs_sparse_j = []
-    A_eqs_sparse_v = []
-    b_eqs = []
-    row_eqs = 0
+    A_i = []
+    A_j = []
+    A_v = []
+    A_rows = 0
+    b = []
 
     # \sum_y \gamma_{a, s, y} = p_{a, s}
     for a in range(self.n_groups_):
       for s in range(n_examples[a]):
-        A_eqs_sparse_i.extend([row_eqs] * self.n_classes_)
-        A_eqs_sparse_j.extend(
+        A_i.extend([A_rows] * self.n_classes_)
+        A_j.extend(
             ravel_index([
                 np.full(self.n_classes_, a),
                 np.full(self.n_classes_, s),
                 np.arange(self.n_classes_),
             ]))
         # Upscale by n_examples[a] to prevent underflow
-        A_eqs_sparse_v.extend([1.0] * self.n_classes_)
-        b_eqs.append(p_by_group[a][s] * n_examples[a] if p_by_group is not None
-                     else 1.0)  # (1 / n_examples[a]) * n_examples[a] = 1
-        row_eqs += 1
+        A_v.extend([1.0] * self.n_classes_)
+        b.append(p_by_group[a][s] * n_examples[a] if p_by_group is not None else
+                 1.0)  # (1 / n_examples[a]) * n_examples[a] = 1
+        A_rows += 1
 
     # \sum_s \gamma_{a, s, y} = q_{a, y}
     for a in range(self.n_groups_):
       for y in range(self.n_classes_):
-        A_eqs_sparse_i.extend([row_eqs] * n_examples[a])
-        A_eqs_sparse_j.extend(
+        A_i.extend([A_rows] * n_examples[a])
+        A_j.extend(
             ravel_index([
                 np.full(n_examples[a], a),
                 np.arange(n_examples[a]),
                 np.full(n_examples[a], y),
             ]))
         # Upscaled by n_examples[a] to prevent underflow
-        A_eqs_sparse_v.extend([1.0] * n_examples[a])
-        A_eqs_sparse_i.append(row_eqs)
-        A_eqs_sparse_j.append(offset_q + a * self.n_classes_ + y)
-        A_eqs_sparse_v.append(-1.0 * n_examples[a])
-        b_eqs.append(0.0)
-        row_eqs += 1
-
-    # \sum_y q_{a, y} = 1
-    for a in range(self.n_groups_):
-      A_eqs_sparse_i.extend([row_eqs] * self.n_classes_)
-      A_eqs_sparse_j.extend(
-          range(offset_q + a * self.n_classes_,
-                offset_q + (a + 1) * self.n_classes_))
-      A_eqs_sparse_v.extend([1.0] * self.n_classes_)
-      b_eqs.append(1.0)
-      row_eqs += 1
+        A_v.extend([1.0] * n_examples[a])
+        A_i.append(A_rows)
+        A_j.append(offset_qs + a * self.n_classes_ + y)
+        A_v.append(-1.0 * n_examples[a])
+        b.append(0.0)
+        A_rows += 1
 
     if q_by_group is None:
       # -\xi_{a, y} <= q_{a, y} - barycenter_{y} <= \xi_{a, y}
       for a in range(self.n_groups_):
         for y in range(self.n_classes_):
           for i in [-1.0, 1.0]:
-            A_ubs_sparse_i.append(row_ubs)
-            A_ubs_sparse_j.append(offset_q + a * self.n_classes_ + y)
-            A_ubs_sparse_v.append(i)
-            A_ubs_sparse_i.append(row_ubs)
-            A_ubs_sparse_j.append(offset_barycenter + y)
-            A_ubs_sparse_v.append(-i)
-            A_ubs_sparse_i.append(row_ubs)
-            A_ubs_sparse_j.append(offset_slacks + a * self.n_classes_ + y)
-            A_ubs_sparse_v.append(-1.0)
-            b_ubs.append(0.0)
-            row_ubs += 1
+            G_i.append(G_rows)
+            G_j.append(offset_qs + a * self.n_classes_ + y)
+            G_v.append(i)
+            G_i.append(G_rows)
+            G_j.append(offset_barycenter + y)
+            G_v.append(-i)
+            G_i.append(G_rows)
+            G_j.append(offset_slacks + a * self.n_classes_ + y)
+            G_v.append(-1.0)
+            h.append(0.0)
+            G_rows += 1
     else:
       for a in range(self.n_groups_):
         for y in range(self.n_classes_):
-          A_eqs_sparse_i.append(row_eqs)
-          A_eqs_sparse_j.append(offset_q + a * self.n_classes_ + y)
-          A_eqs_sparse_v.append(1.0)
-          b_eqs.append(q_by_group[a][y])
-          row_eqs += 1
+          A_i.append(A_rows)
+          A_j.append(offset_qs + a * self.n_classes_ + y)
+          A_v.append(1.0)
+          b.append(q_by_group[a][y])
+          A_rows += 1
 
     # \sum_y \xi_{a, y} <= \epsilon
     for a in range(self.n_groups_):
-      A_ubs_sparse_i.extend([row_ubs] * self.n_classes_)
-      A_ubs_sparse_j.extend(
+      G_i.extend([G_rows] * self.n_classes_)
+      G_j.extend(
           range(offset_slacks + a * self.n_classes_,
                 offset_slacks + (a + 1) * self.n_classes_))
-      A_ubs_sparse_v.extend([1.0] * self.n_classes_)
-      b_ubs.append(eps)
-      row_ubs += 1
+      G_v.extend([1.0] * self.n_classes_)
+      h.append(eps)
+      G_rows += 1
 
-    ## `scipy.optimize.linprog` implementation
-    A_ubs = scipy.sparse.coo_matrix(
-        (A_ubs_sparse_v, (A_ubs_sparse_i, A_ubs_sparse_j)),
-        shape=(row_ubs, n_designs))
-    A_eqs = scipy.sparse.coo_matrix(
-        (A_eqs_sparse_v, (A_eqs_sparse_i, A_eqs_sparse_j)),
-        shape=(row_eqs, n_designs))
-    sol = linprog(np.concatenate([c, [0.0] * (n_designs - len(c))]),
-                  A_ub=A_ubs,
-                  b_ub=b_ubs,
-                  A_eq=A_eqs,
-                  b_eq=b_eqs,
+    ## `scipy.optimize.linprog` interface
+    G = csc_matrix((G_v, (G_i, G_j)), shape=(G_rows, n_designs))
+    h = np.array(h)
+    A = csc_matrix((A_v, (A_i, A_j)), shape=(A_rows, n_designs))
+    b = np.array(b)
+    sol = linprog(np.concatenate([q, [0.0] * (n_designs - len(q))]),
+                  A_ub=G,
+                  b_ub=h,
+                  A_eq=A,
+                  b_eq=b,
                   bounds=(0, None),
                   method="highs")
     x = sol.x
 
-    gammas = []
+    gammas_unnormalized = []
     cost = 0.0
     offset = 0
     for a in range(self.n_groups_):
       this_gamma = x[offset:offset + n_examples[a] * self.n_classes_]
-      gammas.append(this_gamma.reshape((n_examples[a], self.n_classes_)))
-      this_cost = c[offset:offset + n_examples[a] *
+      gammas_unnormalized.append(
+          this_gamma.reshape((n_examples[a], self.n_classes_)))
+      this_cost = q[offset:offset + n_examples[a] *
                     self.n_classes_] * n_examples[a] / n_examples[a_max]
       cost += np.sum(this_gamma / np.sum(this_gamma) * this_cost)
       offset += n_examples[a] * self.n_classes_
     if w is None:
       cost /= self.n_groups_
-    return gammas, cost, x[offset_barycenter:offset_barycenter +
-                           self.n_classes_] if q_by_group is None else None
+    return gammas_unnormalized, cost, x[
+        offset_barycenter:offset_barycenter +
+        self.n_classes_] if q_by_group is None else None
 
-  def extract_monge_transport_(self, probas, gamma):
+  def find_point_(self, probas, gamma):
     """Extract an approximate Monge transport from a Kantorovich simplex-vertex
        transport."""
 
     # Compute boundaries and get constraints for finding feasible point in
     # convex polytope
-    A_ubs_sparse_i = []
-    A_ubs_sparse_j = []
-    A_ubs_sparse_v = []
-    B = np.zeros((self.n_classes_, self.n_classes_))
-    rows = 0
+    G_i = []
+    G_j = []
+    G_v = []
+    G_rows = 0
+    boundaries = np.zeros((self.n_classes_, self.n_classes_))
 
     for i in range(self.n_classes_):
       for j in chain(range(i), range(i + 1, self.n_classes_)):
         idx = gamma[:, i] > 0  # or ~np.isclose(gamma[:, i], 0)?
-        B[i, j] = np.max(probas[idx, j] - probas[idx, i] + 1, initial=0)
-        A_ubs_sparse_i.extend([rows] * 2)
-        A_ubs_sparse_j.extend([i, j])
-        A_ubs_sparse_v.extend([1, -1])
-        rows += 1
+        boundaries[i, j] = np.max(probas[idx, j] - probas[idx, i] + 1,
+                                  initial=0)
+        G_i.extend([G_rows] * 2)
+        G_j.extend([i, j])
+        G_v.extend([1, -1])
+        G_rows += 1
+    boundaries -= np.clip(boundaries + boundaries.T - 2, 0,
+                          None) / 2  # "Fix" numerical imprecisions
+    gaps = (2 - boundaries.T -
+            boundaries)[np.where(~np.eye(self.n_classes_, dtype=bool))]
+    gaps = np.clip(gaps, 1e-2, None)
 
-    # Fix numerical imprecisions
-    B -= np.clip(B + B.T - 2, 0, None) / 2
-    b_ubs = -B[np.where(~np.eye(B.shape[0], dtype=bool))] + 1
+    G = csc_matrix((G_v, (G_i, G_j)), shape=(G_rows, self.n_classes_))
+    h = 1 - boundaries[np.where(~np.eye(self.n_classes_, dtype=bool))]
 
-    # ## `scipy.optimize.linprog` implementation
-    # A_ubs = scipy.sparse.coo_matrix(
-    #     (A_ubs_sparse_v, (A_ubs_sparse_i, A_ubs_sparse_j)),
-    #     shape=(rows, self.n_classes_))
-    # sol = linprog(
-    #     np.zeros(self.n_classes_),
-    #     A_ub=A_ubs,
-    #     b_ub=b_ubs,
-    #     bounds=None,
-    #     method="highs")
+    ## `scipy.optimize.linprog` interface
+    # sol = linprog(np.zeros(self.n_classes_),
+    #               A_ub=G,
+    #               b_ub=h,
+    #               bounds=None,
+    #               method="highs")
     # z = res.x
 
-    ## `cvxopt.solvers.qp` implementation
-    h = matrix(b_ubs.reshape(-1, 1))
-    G = spmatrix(A_ubs_sparse_v,
-                 A_ubs_sparse_i,
-                 A_ubs_sparse_j,
-                 size=(rows, self.n_classes_))
-    P = -1.0 / 2.0 * (G.T * G)
-    q = 2.0 * G.T * h
-
-    with redirect_stdout(io.StringIO()):
-      sol = solvers.qp(P,
-                       q,
-                       G,
-                       h,
-                       kktsolver="ldl",
-                       options={"kktreg": 1e-9})
-    z = np.array(sol["x"]).squeeze()
+    ## `qpsolvers` interface
+    W = csc_matrix(np.diag(1 / gaps**2))
+    z = solve_ls(G, h, G, h, W=W, solver="osqp")
 
     return np.array([0] +
                     [2 * (z[0] - z[j]) for j in range(1, self.n_classes_)])
