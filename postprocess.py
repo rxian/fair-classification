@@ -88,7 +88,7 @@ class PostProcessorDP(BaseEstimator):
     """Find barycenter and Kantorovich simplex-vertex transports of each group.
        Implements the OPT linear program in the paper."""
 
-    # Design variables are the probability mass of the couplings, followed by
+    # Decision variables are the probability mass of the couplings, followed by
     # the barycenter, and the slack variables.
     #
     # They are flattened into a single vector, which when unraveled is a 3d
@@ -101,7 +101,7 @@ class PostProcessorDP(BaseEstimator):
     offset_barycenter = sum(n_examples) * self.n_classes_
     offset_qs = offset_barycenter + self.n_classes_
     offset_slacks = offset_qs + self.n_groups_ * self.n_classes_
-    n_designs = offset_slacks + self.n_groups_ * self.n_classes_
+    n_decisions = offset_slacks + self.n_groups_ * self.n_classes_
 
     def ravel_index(multi_index):
       """Get indexes to flattened couplings given multi-index of groups, example
@@ -211,11 +211,11 @@ class PostProcessorDP(BaseEstimator):
       G_rows += 1
 
     ## `scipy.optimize.linprog` interface
-    G = csc_matrix((G_v, (G_i, G_j)), shape=(G_rows, n_designs))
+    G = csc_matrix((G_v, (G_i, G_j)), shape=(G_rows, n_decisions))
     h = np.array(h)
-    A = csc_matrix((A_v, (A_i, A_j)), shape=(A_rows, n_designs))
+    A = csc_matrix((A_v, (A_i, A_j)), shape=(A_rows, n_decisions))
     b = np.array(b)
-    sol = linprog(np.concatenate([q, [0.0] * (n_designs - len(q))]),
+    sol = linprog(np.concatenate([q, [0.0] * (n_decisions - len(q))]),
                   A_ub=G,
                   b_ub=h,
                   A_eq=A,
