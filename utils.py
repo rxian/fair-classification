@@ -30,7 +30,7 @@ def dp_gap(y_preds, groups, n_classes=None, n_groups=None):
   ])
   output_dists = output_dists / np.sum(output_dists, axis=1, keepdims=True)
   diffs = np.abs(output_dists[:, None, :] - output_dists[None, :, :])
-  return np.max(1 / 2 * np.sum(diffs, axis=2))
+  return np.max(diffs)
 
 
 def perturb(rng, s, bw=1.0, repeat=1, eps=10):

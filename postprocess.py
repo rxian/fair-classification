@@ -201,15 +201,13 @@ class PostProcessorDP(BaseEstimator):
           b.append(q_by_group[a][y])
           A_rows += 1
 
-    # \sum_y \xi_{a, y} <= \epsilon
-    for a in range(self.n_groups_):
-      G_i.extend([G_rows] * self.n_classes_)
-      G_j.extend(
-          range(offset_slacks + a * self.n_classes_,
-                offset_slacks + (a + 1) * self.n_classes_))
-      G_v.extend([1.0] * self.n_classes_)
-      h.append(alpha)
-      G_rows += 1
+    # \xi_{a, y} <= \alpha / 2
+    G_i.extend(range(G_rows, G_rows + self.n_groups_ * self.n_classes_))
+    G_j.extend(
+        range(offset_slacks, offset_slacks + self.n_groups_ * self.n_classes_))
+    G_v.extend([1.0] * self.n_groups_ * self.n_classes_)
+    h.extend([alpha / 2] * self.n_groups_ * self.n_classes_)
+    G_rows += self.n_groups_ * self.n_classes_
 
     ## `scipy.optimize.linprog` interface
     G = csc_matrix((G_v, (G_i, G_j)), shape=(G_rows, n_decisions))
