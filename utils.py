@@ -24,12 +24,12 @@ def dp_gap(y_preds, groups, n_classes=None, n_groups=None):
     group_names, groups = np.unique(groups, return_inverse=True)
     n_groups = len(group_names)
 
-  class_dists = np.array([
+  output_dists = np.array([
       np.bincount(y_preds[groups == a], minlength=n_classes)
       for a in range(n_groups)
   ])
-  class_dists = class_dists / np.sum(class_dists, axis=1, keepdims=True)
-  diffs = np.abs(class_dists[:, None, :] - class_dists[None, :, :])
+  output_dists = output_dists / np.sum(output_dists, axis=1, keepdims=True)
+  diffs = np.abs(output_dists[:, None, :] - output_dists[None, :, :])
   return np.max(1 / 2 * np.sum(diffs, axis=2))
 
 

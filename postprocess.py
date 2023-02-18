@@ -23,14 +23,14 @@ class PostProcessorDP(BaseEstimator):
       Wasserstein-barycenter of class probabilities.
     q_by_group_: list of array-like, shape (n_classes,)
       Output class distributions of each demographic group.
-      May not be equal to barycenter_ when eps > 0.
+      May not be equal to barycenter_ when alpha > 0.
     psi_by_group_: array-like, shape (n_groups, n_classes)
       Parameters of post-processing maps of each group.
     gamma_by_group_: array-like, shape (n_groups, n_examples, n_classes)
       Kantorovich transports (optimal coupling) of each group (unnormalized).
   """
 
-  def fit(self, probas, groups, eps=0.0, w=None, p=None, q_by_group=None):
+  def fit(self, probas, groups, alpha=0.0, w=None, p=None, q_by_group=None):
     """Estimate a post-processing map.
 
     Args:
@@ -38,7 +38,7 @@ class PostProcessorDP(BaseEstimator):
         Class probabilities (predicted) of each example.
       groups: array-like, shape (n_examples,)
         Group label (zero-indexed) of each example.
-      eps: float, optional
+      alpha: float, optional
         Amount of relaxation of DP constraint.  Specifies desired DP gap from
         post-processing.  Default is 0.
       w: array-like, shape (n_groups,), optional
@@ -63,7 +63,7 @@ class PostProcessorDP(BaseEstimator):
 
     gammas_unnormalized, cost, barycenter = self.linprog_dp_(
         probas_by_group,
-        eps=eps,
+        alpha=alpha,
         w=w,
         p_by_group=p_by_group,
         q_by_group=q_by_group)
@@ -81,7 +81,7 @@ class PostProcessorDP(BaseEstimator):
 
   def linprog_dp_(self,
                   probas_by_group,
-                  eps=0.0,
+                  alpha=0.0,
                   w=None,
                   p_by_group=None,
                   q_by_group=None):
@@ -89,11 +89,12 @@ class PostProcessorDP(BaseEstimator):
        Implements the OPT linear program in the paper."""
 
     # Decision variables are the probability mass of the couplings, followed by
-    # the barycenter, and the slack variables.
+    # the barycenter, the output distributions, and the slack variables.
     #
-    # They are flattened into a single vector, which when unraveled is a 3d
-    # tensor of shape (n_groups, n_examples, n_classes), followed by a vector of
-    # length (n_classes,), and two 2d tensors of shape (n_groups, n_classes).
+    # They are flattened into a single vector, which when unraveled is arrays
+    # of shapes (n_examples[a], n_classes) for a = 1, ..., n_groups,
+    # followed by a vector of length (n_classes,), and two arrays of
+    # shape (n_groups, n_classes).
 
     n_examples = [len(probas) for probas in probas_by_group]
     a_max = np.argmax(n_examples)
@@ -207,7 +208,7 @@ class PostProcessorDP(BaseEstimator):
           range(offset_slacks + a * self.n_classes_,
                 offset_slacks + (a + 1) * self.n_classes_))
       G_v.extend([1.0] * self.n_classes_)
-      h.append(eps)
+      h.append(alpha)
       G_rows += 1
 
     ## `scipy.optimize.linprog` interface
