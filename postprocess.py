@@ -11,98 +11,97 @@ from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 class PostProcessorDP(BaseEstimator):
   """Post-processing mapping for DP fairness.
 
+  Based on the paper https://arxiv.org/abs/2211.01528.
+
   Attributes:
     n_classes_: int
       Number of classes.
     n_groups_: int
       Number of demographic groups.
     score_: float
-      Group-weighted classification error of training examples post-processed
-      with Kantorovich transports.
-    barycenter_: array-like, shape (n_classes,)
-      Wasserstein-barycenter of class probabilities.
-    q_by_group_: list of array-like, shape (n_classes,)
-      Output class distributions of each demographic group.
-      May not be equal to barycenter_ when alpha > 0.
+      Weighted classification error on post-processed training examples.
     psi_by_group_: array-like, shape (n_groups, n_classes)
-      Parameters of post-processing maps of each group.
+      Parameters of post-processing maps.
+    q_by_group_: list of array-like, shape (n_classes,)
+      Distributions of class assignments on post-processed training examples.
     gamma_by_group_: array-like, shape (n_groups, n_examples, n_classes)
-      Kantorovich transports (optimal coupling) of each group (unnormalized).
+      Class assignments of each post-processed training example (unnormalized).
   """
 
-  def fit(self, probas, groups, alpha=0.0, w=None, p=None, q_by_group=None):
+  def fit(self, scores, groups, alpha=0.0, w=None, r=None, q_by_group=None):
     """Estimate a post-processing map.
 
     Args:
-      probas: array-like, shape (n_examples, n_classes)
-        Class probabilities (predicted) of each example.
+      scores: array-like, shape (n_examples, n_classes)
+        Predictor scores/class probabilities of each example.
       groups: array-like, shape (n_examples,)
         Group label (zero-indexed) of each example.
       alpha: float, optional
-        Amount of relaxation of DP constraint.  Specifies desired DP gap from
-        post-processing.  Default is 0.
+        Relaxation of DP constraint.  Specifies desired DP gap from 
+        post-processing.  Default is 0 (exact DP).
       w: array-like, shape (n_groups,), optional
-        Weights assigned to each group for weighting classification error.
-        Default is uniform (group-balanced).
-      p: array-like, shape (n_examples,), optional
-        Probability masses of each example.  Default is uniform.
+        Weight of each group for weighting classification error (need not be
+        normalized).  Default is uniform (group-balanced).
+      r: array-like, shape (n_examples,), optional
+        Probability mass of each example (need not be normalized, e.g., to avoid
+        underflow).  Default is uniform.
       q_by_group: list of array-like, shape (n_classes,), optional
-        Specify target output class distributions of each demographic group.
+        Specify desired distributions of class assignments of each group.
     """
-    probas, groups = check_X_y(probas, groups)
-    if p is not None:
-      _, p = check_X_y(probas, p)
+    scores, groups = check_X_y(scores, groups)
+    if r is not None:
+      _, r = check_X_y(scores, r)
 
-    self.n_classes_ = probas.shape[-1]
+    self.n_classes_ = scores.shape[-1]
     self.n_groups_ = int(1 + np.max(groups))
+    self.alpha_ = alpha
+    if w is None:
+      w = [1.0 for _ in range(self.n_groups_)]
+    self.w_ = w
 
-    probas_by_group = [probas[groups == i] for i in range(self.n_groups_)]
-    p_by_group = None if p is None else [
-        p[groups == i] / np.sum(p[groups == i]) for i in range(self.n_groups_)
-    ]
+    scores_by_group = [scores[groups == a] for a in range(self.n_groups_)]
+    r_by_group = [(r[groups == a] if r is not None else np.ones(
+        (groups == a).sum())) for a in range(self.n_groups_)]
 
-    gammas_unnormalized, cost, barycenter = self.linprog_dp_(
-        probas_by_group,
+    self.score_, self.q_by_group_, self.gamma_by_group_ = self.linprog_dp_(
+        scores_by_group,
         alpha=alpha,
         w=w,
-        p_by_group=p_by_group,
+        r_by_group=r_by_group,
         q_by_group=q_by_group)
-    self.score_ = cost
-    self.gamma_by_group_ = [
-        gamma / gamma.sum() for gamma in gammas_unnormalized
-    ]
-    self.barycenter_ = barycenter
-    self.q_by_group_ = [gamma.sum(axis=0) for gamma in self.gamma_by_group_]
     self.psi_by_group_ = np.stack([
-        self.find_point_(probas_by_group[i], gammas_unnormalized[i])
-        for i in range(self.n_groups_)
+        self.find_point_(scores_by_group[a], self.gamma_by_group_[a])
+        for a in range(self.n_groups_)
     ])
     return self
 
   def linprog_dp_(self,
-                  probas_by_group,
-                  alpha=0.0,
-                  w=None,
-                  p_by_group=None,
-                  q_by_group=None):
-    """Find barycenter and Kantorovich simplex-vertex transports of each group.
-       Implements the OPT linear program in the paper."""
+                  scores_by_group,
+                  alpha,
+                  w,
+                  r_by_group,
+                  q_by_group=None,
+                  tol=1e-6):
+    """This implements the LP in the paper (Line 3 of Algorithm 2)."""
 
     # Decision variables are the probability mass of the couplings, followed by
     # the barycenter, the output distributions, and the slack variables.
     #
-    # They are flattened into a single vector, which when unraveled is arrays
-    # of shapes (n_examples[a], n_classes) for a = 1, ..., n_groups,
-    # followed by a vector of length (n_classes,), and two arrays of
-    # shape (n_groups, n_classes).
+    # They are flattened and concatenated into a single vector, which when
+    # unpacked and unraveled are tensors of shapes:
+    # - (n_examples[a], n_classes), for a = 1, ..., n_groups
+    # - (n_classes,)
+    # - (n_groups, n_classes)
+    # - (n_groups, n_classes)
 
-    n_examples = [len(probas) for probas in probas_by_group]
-    a_max = np.argmax(n_examples)
+    n_examples = [len(scores) for scores in scores_by_group]
+    total_r = [r.sum() for r in r_by_group]
+    a_max = np.argmax(total_r)
 
     offset_barycenter = sum(n_examples) * self.n_classes_
     offset_qs = offset_barycenter + self.n_classes_
     offset_slacks = offset_qs + self.n_groups_ * self.n_classes_
-    n_decisions = offset_slacks + self.n_groups_ * self.n_classes_
+    n_variables = offset_slacks + self.n_groups_ * self.n_classes_
 
     def ravel_index(multi_index):
       """Get indexes to flattened couplings given multi-index of groups, example
@@ -117,17 +116,16 @@ class PostProcessorDP(BaseEstimator):
       return [int(x) for x in indices]
 
     # l_1 transportation costs
-    q = []
+    cost = []
     for a in range(self.n_groups_):
       s = np.repeat(np.arange(n_examples[a]), self.n_classes_, axis=0)
       y = np.tile(np.arange(self.n_classes_), n_examples[a])
-      costs = 1 - probas_by_group[a][s, y]
-      if w is not None:
-        costs *= w[a]
-      # Normalize, due to the upscaling (see implementation below)
-      costs *= n_examples[a_max] / n_examples[a]
-      q.extend(costs)
-    q = np.array(q)
+      c = 1 - scores_by_group[a][s, y]
+      # Normalize according to total p_by_group
+      c *= total_r[a_max] / total_r[a]
+      c *= w[a]
+      cost.extend(c)
+    cost = np.array(cost)
 
     # Get constraints
     G_i = []
@@ -142,7 +140,7 @@ class PostProcessorDP(BaseEstimator):
     A_rows = 0
     b = []
 
-    # \sum_y \gamma_{a, s, y} = p_{a, s}
+    # \sum_y \gamma_{a, s, y} = r_{a, s}
     for a in range(self.n_groups_):
       for s in range(n_examples[a]):
         A_i.extend([A_rows] * self.n_classes_)
@@ -152,11 +150,9 @@ class PostProcessorDP(BaseEstimator):
                 np.full(self.n_classes_, s),
                 np.arange(self.n_classes_),
             ]))
-        # Upscale by n_examples[a] to prevent underflow
         A_v.extend([1.0] * self.n_classes_)
-        b.append(p_by_group[a][s] * n_examples[a] if p_by_group is not None else
-                 1.0)  # (1 / n_examples[a]) * n_examples[a] = 1
         A_rows += 1
+      b.extend(r_by_group[a])
 
     # \sum_s \gamma_{a, s, y} = q_{a, y}
     for a in range(self.n_groups_):
@@ -168,11 +164,10 @@ class PostProcessorDP(BaseEstimator):
                 np.arange(n_examples[a]),
                 np.full(n_examples[a], y),
             ]))
-        # Upscaled by n_examples[a] to prevent underflow
         A_v.extend([1.0] * n_examples[a])
         A_i.append(A_rows)
         A_j.append(offset_qs + a * self.n_classes_ + y)
-        A_v.append(-1.0 * n_examples[a])
+        A_v.append(-1.0 * total_r[a])
         b.append(0.0)
         A_rows += 1
 
@@ -192,6 +187,16 @@ class PostProcessorDP(BaseEstimator):
             G_v.append(-1.0)
             h.append(0.0)
             G_rows += 1
+
+      # \xi_{a, y} <= \alpha / 2
+      G_i.extend(range(G_rows, G_rows + self.n_groups_ * self.n_classes_))
+      G_j.extend(
+          range(offset_slacks,
+                offset_slacks + self.n_groups_ * self.n_classes_))
+      G_v.extend([1.0] * self.n_groups_ * self.n_classes_)
+      h.extend([alpha / 2] * self.n_groups_ * self.n_classes_)
+      G_rows += self.n_groups_ * self.n_classes_
+
     else:
       for a in range(self.n_groups_):
         for y in range(self.n_classes_):
@@ -201,48 +206,44 @@ class PostProcessorDP(BaseEstimator):
           b.append(q_by_group[a][y])
           A_rows += 1
 
-    # \xi_{a, y} <= \alpha / 2
-    G_i.extend(range(G_rows, G_rows + self.n_groups_ * self.n_classes_))
-    G_j.extend(
-        range(offset_slacks, offset_slacks + self.n_groups_ * self.n_classes_))
-    G_v.extend([1.0] * self.n_groups_ * self.n_classes_)
-    h.extend([alpha / 2] * self.n_groups_ * self.n_classes_)
-    G_rows += self.n_groups_ * self.n_classes_
-
-    ## `scipy.optimize.linprog` interface
-    G = csc_matrix((G_v, (G_i, G_j)), shape=(G_rows, n_decisions))
+    # `scipy.optimize.linprog` interface
+    G = csc_matrix((G_v, (G_i, G_j)), shape=(G_rows, n_variables))
     h = np.array(h)
-    A = csc_matrix((A_v, (A_i, A_j)), shape=(A_rows, n_decisions))
+    A = csc_matrix((A_v, (A_i, A_j)), shape=(A_rows, n_variables))
     b = np.array(b)
-    sol = linprog(np.concatenate([q, [0.0] * (n_decisions - len(q))]),
+    sol = linprog(np.concatenate([cost, [0.0] * (n_variables - len(cost))]),
                   A_ub=G,
                   b_ub=h,
                   A_eq=A,
                   b_eq=b,
                   bounds=(0, None),
-                  method="highs")
+                  method="highs",
+                  options={
+                      "dual_feasibility_tolerance": tol,
+                      "primal_feasibility_tolerance": tol,
+                  })
+    assert sol.status == 0, sol.message
     x = sol.x
 
-    gammas_unnormalized = []
-    cost = 0.0
+    gammas_by_group_unnormalized = []
+    total_cost = 0.0
     offset = 0
     for a in range(self.n_groups_):
       this_gamma = x[offset:offset + n_examples[a] * self.n_classes_]
-      gammas_unnormalized.append(
+      gammas_by_group_unnormalized.append(
           this_gamma.reshape((n_examples[a], self.n_classes_)))
-      this_cost = q[offset:offset + n_examples[a] *
-                    self.n_classes_] * n_examples[a] / n_examples[a_max]
-      cost += np.sum(this_gamma / np.sum(this_gamma) * this_cost)
+      c = cost[offset:offset + n_examples[a] * self.n_classes_]
+      total_cost += np.sum(this_gamma * c) / total_r[a_max]
       offset += n_examples[a] * self.n_classes_
-    if w is None:
-      cost /= self.n_groups_
-    return gammas_unnormalized, cost, x[
-        offset_barycenter:offset_barycenter +
-        self.n_classes_] if q_by_group is None else None
+    total_cost /= sum(w)
 
-  def find_point_(self, probas, gamma):
-    """Extract an approximate Monge transport from a Kantorovich simplex-vertex
-       transport."""
+    return total_cost, [
+        x[offset_qs + a * self.n_classes_:offset_qs + (a + 1) * self.n_classes_]
+        for a in range(self.n_groups_)
+    ], gammas_by_group_unnormalized
+
+  def find_point_(self, scores, gamma):
+    """Extract post-processing map from LP solution (Lines 6-9 of Alg. 2)."""
 
     # Compute boundaries and get constraints for finding feasible point in
     # convex polytope
@@ -255,22 +256,22 @@ class PostProcessorDP(BaseEstimator):
     for i in range(self.n_classes_):
       for j in chain(range(i), range(i + 1, self.n_classes_)):
         idx = gamma[:, i] > 0  # or ~np.isclose(gamma[:, i], 0)?
-        boundaries[i, j] = np.max(probas[idx, j] - probas[idx, i] + 1,
+        boundaries[i, j] = np.max(scores[idx, j] - scores[idx, i] + 1,
                                   initial=0)
         G_i.extend([G_rows] * 2)
         G_j.extend([i, j])
         G_v.extend([1, -1])
         G_rows += 1
-    boundaries -= np.clip(boundaries + boundaries.T - 2, 0,
-                          None) / 2  # "Fix" numerical imprecisions
+    boundaries -= np.clip(
+        boundaries + boundaries.T - 2, 0,
+        None) / 2  # in case of non-optimal LP solution, incl. numerical issues
     gaps = (2 - boundaries.T -
             boundaries)[np.where(~np.eye(self.n_classes_, dtype=bool))]
-    gaps = np.clip(gaps, 1e-2, None)
 
     G = csc_matrix((G_v, (G_i, G_j)), shape=(G_rows, self.n_classes_))
     h = 1 - boundaries[np.where(~np.eye(self.n_classes_, dtype=bool))]
 
-    ## `scipy.optimize.linprog` interface
+    # # `scipy.optimize.linprog` interface
     # sol = linprog(np.zeros(self.n_classes_),
     #               A_ub=G,
     #               b_ub=h,
@@ -278,24 +279,26 @@ class PostProcessorDP(BaseEstimator):
     #               method="highs")
     # z = res.x
 
-    ## `qpsolvers` interface
-    W = csc_matrix(np.diag(1 / gaps**2))
+    # `qpsolvers` interface
+    W = csc_matrix(np.diag(1 / np.clip(gaps, 1e-2, None)**
+                           2))  # ignore small gaps, prevent division by zero
     z = solve_ls(G, h, G, h, W=W, solver="osqp")
+    assert z is not None, f"No feasible point found; should not happen...\nboundaries =\n{boundaries}"
 
     return np.array([0] +
                     [2 * (z[0] - z[j]) for j in range(1, self.n_classes_)])
 
-  def predict(self, probas, groups):
-    """Output class assignments given probas and group labels.
+  def predict(self, scores, groups):
+    """Output fair class assignments given predictor scores.
 
     Args:
-      probas: array-like, shape (n_examples, n_classes)
-        Class probabilities (predicted) of each example.
+      scores: array-like, shape (n_examples, n_classes)
+        Predictor scores/class probabilities of each example.
       groups: array-like, shape (n_examples,)
         Group label (zero-indexed) of each example.
     """
     check_is_fitted(self, "psi_by_group_")
-    probas = check_array(probas)
+    scores = check_array(scores)
     groups = check_array(groups, ensure_2d=False)
-    probas, groups = check_X_y(probas, groups)
-    return np.argmin(2 * (1 - probas) - self.psi_by_group_[groups], axis=1)
+    scores, groups = check_X_y(scores, groups)
+    return np.argmin(2 * (1 - scores) - self.psi_by_group_[groups], axis=1)

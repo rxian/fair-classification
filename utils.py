@@ -15,7 +15,7 @@ def error_rate(y, y_preds, groups=None, w=None, n_groups=None):
     ])
 
 
-def dp_gap(y_preds, groups, n_classes=None, n_groups=None):
+def delta_dp(y_preds, groups, n_classes=None, n_groups=None):
   """Compute DP gap."""
   if n_classes is None:
     class_names, y_preds = np.unique(y_preds, return_inverse=True)
