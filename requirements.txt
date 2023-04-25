@@ -1,11 +1,12 @@
+cvxpy
+cylp
 datasets
 matplotlib
 numpy
 osqp
 pandas
-qpsolvers
 scikit-learn
-scipy<1.9.0
+scipy
 torch
 tqdm
 tokenizers
