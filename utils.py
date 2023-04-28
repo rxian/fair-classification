@@ -106,8 +106,9 @@ def postprocess(alpha_seed_and_kwargs,
       # Evaluate the post-processed model
       test_preds = postprocessor.predict(test_probas, test_groups)
     except Exception:
-      print(f"Post-processing failed with alpha={alpha} and seed={seed}:")
-      print(traceback.format_exc())
+      print(
+          f"Post-processing failed with alpha={alpha} and seed={seed}:\n{traceback.format_exc()}",
+          flush=True)
       return alpha, seed, None, None
 
   return alpha, seed, evaluate_fn(test_labels, test_preds,

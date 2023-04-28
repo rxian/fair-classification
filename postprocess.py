@@ -1,4 +1,4 @@
-from collections import defaultdict, deque
+from collections import defaultdict
 from itertools import chain
 import warnings
 
@@ -6,39 +6,6 @@ import numpy as np
 import cvxpy as cp
 from sklearn.base import BaseEstimator
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
-
-
-class UndirectedGraph():
-  """Undirected graph data structure with basic features."""
-
-  def __init__(self, edges=[]):
-    self.adjacency_list = defaultdict(set)
-    self.add_edges(edges)
-
-  def get_nodes(self):
-    return self.adjacency_list.keys()
-
-  def get_neighbors(self, node):
-    return self.adjacency_list[node]
-
-  def add_edges(self, edges):
-    for a, b in edges:
-      self.adjacency_list[a].add(b)
-      self.adjacency_list[b].add(a)
-
-  def connected(self, a, b):
-    # BFS to check if two nodes are connected
-    visited = set()
-    queue = deque([a])
-    while queue:
-      node = queue.popleft()
-      if node == b:
-        return True
-      visited.add(node)
-      for neighbor in self.get_neighbors(node):
-        if neighbor not in visited:
-          queue.append(neighbor)
-    return False
 
 
 class PostProcessorDP(BaseEstimator):
@@ -87,7 +54,7 @@ class PostProcessorDP(BaseEstimator):
         normalized).  Default is uniform.
       q_by_group: list of array-like, shape (n_classes,), optional
         Specify desired distributions of class assignments of each group.
-      """
+    """
     scores, groups = check_X_y(scores, groups)
     if r is not None:
       _, r = check_X_y(scores, r)
@@ -141,7 +108,7 @@ class PostProcessorDP(BaseEstimator):
       except cp.error.SolverError:
         # This can happen when OSQP fails to converge, or `gamma_by_group_` is
         # not optimal
-        warnings.warn("Point-finding QP failed, falling back to LP.")
+        # warnings.warn("Point-finding QP failed, falling back to LP.")
         problem = self.linprog_score_transform_(scores_by_group[a],
                                                 self.gamma_by_group_[a],
                                                 tol=tol)
@@ -249,34 +216,25 @@ class PostProcessorDP(BaseEstimator):
 
   def linprog_score_transform_(self, scores, gamma, tol=1e-8):
 
-    bias = cp.Variable(self.n_classes_, name="bias")
-    constraints = []
-
-    eq_classes = UndirectedGraph()
-    for s, g in zip(scores, gamma):
-      candidates = np.where(g > tol)[0]  # or use np.isclose?
-      if len(candidates) > 1:
-        # b_i + s_i = b_j + s_j, for i, j in candidates
-        for l, i in enumerate(candidates):
-          for j in candidates[l + 1:]:
-            if not eq_classes.connected(i, j):
-              constraints.append(bias[i] + s[i] == bias[j] + s[j])
-              eq_classes.add_edges([(i, j)])
-              # print(f'b_{i} + {s[i]} = b_{j} + {s[j]}')
-
-    diffs = np.full((self.n_classes_, self.n_classes_), -np.inf)
+    diffs = defaultdict(dict)
     for s, g in zip(scores, gamma):
       candidates = set(np.where(g > tol)[0])  # or use np.isclose?
       for i in candidates:
-        for j in range(self.n_classes_):
-          if j not in candidates and not eq_classes.connected(i, j):
-            diffs[i, j] = max(s[j] - s[i], diffs[i, j])
-    for i in range(self.n_classes_):
-      for j in range(self.n_classes_):
-        if i != j and not eq_classes.connected(i, j):
-          constraints.append(bias[i] - bias[j] + tol >= diffs[i, j])
+        for j in chain(range(i), range(i + 1, self.n_classes_)):
+          # b_i + s_i >= b_j + s_j <==> b_i - b_j >= s_j - s_i
+          # w = s_j - s_i
+          d = s[j] - s[i]
+          new_d = d if j not in diffs[i] else max(d, diffs[i][j])
+          diffs[i][j] = new_d
 
-    return cp.Problem(cp.Minimize(0), constraints)
+    # Slack variables for handling numerical issues
+    bias = cp.Variable(self.n_classes_, name="bias")
+    slack = cp.Variable((self.n_classes_, self.n_classes_), name="slack")
+    constraints = [slack >= 0]
+    for i in diffs:
+      for j in diffs[i]:
+        constraints.append(bias[i] + slack[i][j] >= bias[j] + diffs[i][j])
+    return cp.Problem(cp.Minimize(cp.sum(slack)), constraints)
 
   def predict(self, scores, groups):
     """Output DP fair class assignments given predictor scores.
