@@ -1,6 +1,5 @@
 from collections import defaultdict
 from itertools import chain
-import warnings
 
 import numpy as np
 import cvxpy as cp
@@ -9,9 +8,9 @@ from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 
 
 class PostProcessorDP(BaseEstimator):
-  """Post-processing mapping for DP fairness.
+  """Post-processor for DP fairness.
 
-  Based on the paper https://arxiv.org/abs/2211.01528.
+  Based on Algorithm 2 of https://arxiv.org/abs/2211.01528.
 
   Attributes:
     n_classes_: int
@@ -19,54 +18,61 @@ class PostProcessorDP(BaseEstimator):
     n_groups_: int
       Number of demographic groups.
     score_: float
-      Weighted classification error on post-processed training examples.
+      Weighted classification error on post-processed training examples (naming
+      follows sklearn convention; to be distinguished from the class
+      probabilities scores). 
     psi_by_group_: array-like, shape (n_groups, n_classes)
       Parameters of post-processing maps.
     q_by_group_: list of array-like, shape (n_classes,)
       Distributions of class assignments on post-processed training examples.
     gamma_by_group_: array-like, shape (n_groups, n_examples, n_classes)
-      Class assignments of each post-processed training example (unnormalized).
+      Probabilistic class assignments of each post-processed training example
+      (unnormalized).
   """
 
   def fit(self,
           scores,
           groups,
           alpha=0.0,
-          w=None,
-          r=None,
+          group_weight=None,
+          sample_weight=None,
           q_by_group=None,
           tol=1e-8):
-    """Estimate a post-processing map.
+    """Perform post-processing using finite samples.
 
     Args:
       scores: array-like, shape (n_examples, n_classes)
-        Predictor scores/class probabilities of each example.
+        Scores/class probabilities of each example.
       groups: array-like, shape (n_examples,)
-        Group label (zero-indexed) of each example.
+        Group label (zero-indexed) of each example; the sensitive attribute.
       alpha: float, optional
         Relaxation of DP constraint.  Specifies desired DP gap from 
         post-processing.  Default is 0 (exact DP).
-      w: array-like, shape (n_groups,), optional
+      group_weight: array-like, shape (n_groups,), optional
         Weight of each group for weighting classification error (need not be
-        normalized).  Default is uniform (group-balanced).
-      r: array-like, shape (n_examples,), optional
-        Instance weight; probability mass of each example (need not be
-        normalized).  Default is uniform.
+        normalized).  Default is empirical distribution of groups.
+      sample_weight: array-like, shape (n_examples,), optional
+        Weight of each example (need not be normalized).  Default is uniform.
       q_by_group: list of array-like, shape (n_classes,), optional
         Specify desired distributions of class assignments of each group.
     """
     scores, groups = check_X_y(scores, groups)
-    if r is not None:
-      _, r = check_X_y(scores, r)
+    if sample_weight is not None:
+      _, r = check_X_y(scores, sample_weight)
+    else:
+      r = None
 
     self.n_classes_ = scores.shape[-1]
     self.n_groups_ = int(1 + np.max(groups))
     self.alpha_ = alpha
-    if w is None:
+    if group_weight is None:
       w = np.bincount(groups, minlength=self.n_groups_) / len(groups)
+    else:
+      w = group_weight
     self.w_ = w
 
     scores_by_group = [scores[groups == a] for a in range(self.n_groups_)]
+    # self.scores_by_group_ = scores_by_group  # for debugging
     r_by_group = []
     for a in range(self.n_groups_):
       if r is not None:
@@ -92,7 +98,6 @@ class PostProcessorDP(BaseEstimator):
         problem.var_dict[f'gamma_{a}'].value for a in range(self.n_groups_)
     ]
 
-    # self.scores_by_group_ = scores_by_group
     psi_by_group = []
     for a in range(self.n_groups_):
       try:
@@ -106,9 +111,8 @@ class PostProcessorDP(BaseEstimator):
         psi_by_group.append(
             [0] + [2 * (z[0] - z[j]) for j in range(1, self.n_classes_)])
       except cp.error.SolverError:
-        # This can happen when OSQP fails to converge, or `gamma_by_group_` is
-        # not optimal
-        # warnings.warn("Point-finding QP failed, falling back to LP.")
+        # Occurs if OSQP fails to converge, or `gamma_by_group_` is not optimal.
+        # Fall back to an alternative linear program formulation.
         problem = self.linprog_score_transform_(scores_by_group[a],
                                                 self.gamma_by_group_[a],
                                                 tol=tol)
@@ -205,16 +209,15 @@ class PostProcessorDP(BaseEstimator):
     # Get cost and build constraints
     cost = 0
     constraints = []
-
     for i in range(self.n_classes_):
       for j in chain(range(i), range(i + 1, self.n_classes_)):
         # z_j - z_i >= B_ij - 1
         constraints.append(z[j] - z[i] >= boundaries[i, j] - 1)
         cost += cp.square(z[j] - z[i] - (boundaries[i, j] - 1)) / gaps[i, j]**2
-
     return cp.Problem(cp.Minimize(cost), constraints)
 
   def linprog_score_transform_(self, scores, gamma, tol=1e-8):
+    """Extract post-processing map from LP solution (Lines 6-9 of Alg. 2)."""
 
     diffs = defaultdict(dict)
     for s, g in zip(scores, gamma):
@@ -222,7 +225,6 @@ class PostProcessorDP(BaseEstimator):
       for i in candidates:
         for j in chain(range(i), range(i + 1, self.n_classes_)):
           # b_i + s_i >= b_j + s_j <==> b_i - b_j >= s_j - s_i
-          # w = s_j - s_i
           d = s[j] - s[i]
           new_d = d if j not in diffs[i] else max(d, diffs[i][j])
           diffs[i][j] = new_d
@@ -237,13 +239,17 @@ class PostProcessorDP(BaseEstimator):
     return cp.Problem(cp.Minimize(cp.sum(slack)), constraints)
 
   def predict(self, scores, groups):
-    """Output DP fair class assignments given predictor scores.
+    """Output DP fair class assignments given scores.
 
     Args:
       scores: array-like, shape (n_examples, n_classes)
-        Predictor scores/class probabilities of each example.
+        Scores/class probabilities of each example.
       groups: array-like, shape (n_examples,)
-        Group label (zero-indexed) of each example.
+        Group label (zero-indexed) of each example; the sensitive attribute.
+
+    Returns:
+      array-like, shape (n_examples,)
+      Fair class assignments (zero-indexed) of each example.
     """
     scores = check_array(scores)
     groups = check_array(groups, ensure_2d=False)

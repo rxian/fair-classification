@@ -1,18 +1,16 @@
-# Fair Classification
+# Fair Classification via Post-Processing
 
-Post-process pre-trained predictors for satisfying demographic parity (DP).
+Post-process scoring models for demographic parity.
 
 Post-processor is implemented in `postprocess.py`.
 
-Notebooks `adult.ipynb`, `communities.ipynb` and `biasbios.ipynb` contain the code for reproducing the results in our paper:
+Notebooks `dp_acsincome.ipynb`, `dp_biasbios.ipynb`, `dp_adult.ipynb`, and `dp_communities.ipynb` reproduce the results in:
 
 ```bibtex
-@misc{xian2022FairOptimalClassification,
-  title         = {Fair and {{Optimal Classification}} via {{Post-Processing Predictors}}},
-  author        = {Xian, Ruicheng and Yin, Lang and Zhao, Han},
-  year          = {2023},
-  archiveprefix = {arXiv},
-  eprint        = {2211.01528},
-  primaryclass  = {cs.LG}
+@inproceedings{xian2023FairOptimalClassification,
+  title     = {Fair and {{Optimal Classification}} via {{Post-Processing}}},
+  booktitle = {Proceedings of the 40th {{International Conference}} on {{Machine Learning}}},
+  author    = {Xian, Ruicheng and Yin, Lang and Zhao, Han},
+  year      = {2023}
 }
 ```

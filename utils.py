@@ -38,34 +38,11 @@ def delta_dp(y_preds, groups, n_classes=None, n_groups=None, ord=np.inf):
   return np.max(diffs)
 
 
-def perturb(s, repeat, bw=1.0, eps=10, seed=33):
-  """Perturb points on the simplex via the dirichlet distribution."""
-  s = np.array(s)
-  scale = np.min([
-      np.min(s + eps * bw, axis=1, keepdims=True),
-      np.min(1 - s + eps * bw, axis=1, keepdims=True)
-  ],
-                 axis=0)
-  scale = (scale * (1 - scale)) / bw
-  s = (s + eps * bw) * scale
-  return np.concatenate(
-      [np.random.default_rng(seed).dirichlet(r, size=repeat) for r in s],
-      axis=0)
-
-
 # Define some utility functions
 
 
-def postprocess(alpha_seed_and_kwargs,
-                postprocessor_factory,
-                evaluate_fn,
-                probas,
-                labels,
-                groups,
-                n_test,
-                n_post,
-                n_perturbs=0,
-                perturb_fn=None):
+def postprocess(alpha_seed_and_kwargs, postprocessor_factory, evaluate_fn,
+                probas, labels, groups, n_test, n_post):
 
   if len(alpha_seed_and_kwargs) == 2:
     alpha, seed = alpha_seed_and_kwargs
@@ -85,12 +62,6 @@ def postprocess(alpha_seed_and_kwargs,
   test_probas = probas[idx_test]
   test_labels = labels[idx_test]
   test_groups = groups[idx_test]
-
-  if n_perturbs > 0:
-    train_probas_post = perturb_fn(train_probas_post, n_perturbs)
-    train_labels_post = np.repeat(train_labels_post, n_perturbs)
-    train_groups_post = np.repeat(train_groups_post, n_perturbs)
-    test_probas = perturb_fn(test_probas, 1)
 
   if alpha == np.inf:
     # Evaluate the unprocessed model
@@ -122,7 +93,7 @@ def evaluate(test_labels,
              n_classes=2,
              metrics=None):
   result = {}
-  result['error_rate'] = error_rate(
+  result['accuracy'] = 1 - error_rate(
       test_labels,
       test_preds,
       test_groups,
@@ -153,9 +124,9 @@ def plot_results(results, metric):
   df1 = df[df.index != np.inf]
   markers, caps, bars = ax.errorbar(
       df1[metric]['mean'].values,
-      df1['error_rate']['mean'].values,
+      df1['accuracy']['mean'].values,
       xerr=df1[metric]['std'].values,
-      yerr=df1['error_rate']['std'].values,
+      yerr=df1['accuracy']['std'].values,
       fmt='o',
   )
   [bar.set_alpha(0.4) for bar in bars]
@@ -164,15 +135,15 @@ def plot_results(results, metric):
     df2 = df[df.index == np.inf]
     markers, caps, bars = ax.errorbar(
         df2[metric]['mean'].values,
-        df2['error_rate']['mean'].values,
+        df2['accuracy']['mean'].values,
         xerr=df2[metric]['std'].values,
-        yerr=df2['error_rate']['std'].values,
+        yerr=df2['accuracy']['std'].values,
         fmt='o',
         color='tab:blue',
         markerfacecolor='w',
     )
     [bar.set_alpha(0.4) for bar in bars]
   ax.set_xlabel(metric)
-  ax.set_ylabel("Error rate")
+  ax.set_ylabel("Accuracy")
   ax.grid(True, which="both", zorder=0)
   return (fig, ax), df
