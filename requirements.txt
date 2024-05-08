@@ -1,9 +1,7 @@
 cvxpy
-cylp
 datasets
 matplotlib
 numpy
-osqp
 pandas
 scikit-learn
 scipy

@@ -1,259 +1,314 @@
-from collections import defaultdict
-from itertools import chain
+"""Post-processing for fair classification."""
+
+from typing import Any, Callable, Dict, Optional, Tuple
+from typing_extensions import Self
 
 import numpy as np
 import cvxpy as cp
-from sklearn.base import BaseEstimator
-from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 
 
-class PostProcessorDP(BaseEstimator):
-  """Post-processor for DP fairness.
-
-  Based on Algorithm 2 of https://arxiv.org/abs/2211.01528.
-
-  Attributes:
-    n_classes_: int
-      Number of classes.
-    n_groups_: int
-      Number of demographic groups.
-    score_: float
-      Weighted classification error on post-processed training examples (naming
-      follows sklearn convention; to be distinguished from the class
-      probabilities scores). 
-    psi_by_group_: array-like, shape (n_groups, n_classes)
-      Parameters of post-processing maps.
-    q_by_group_: list of array-like, shape (n_classes,)
-      Distributions of class assignments on post-processed training examples.
-    gamma_by_group_: array-like, shape (n_groups, n_examples, n_classes)
-      Probabilistic class assignments of each post-processed training example
-      (unnormalized).
+class PostProcessor:
+  """
+  A post-processor on top of pre-trained predictors for achieving fair
+  classification (0-1 loss).
   """
 
-  def fit(self,
-          scores,
-          groups,
-          alpha=0.0,
-          group_weight=None,
-          sample_weight=None,
-          q_by_group=None,
-          tol=1e-8):
-    """Perform post-processing using finite samples.
-
-    Args:
-      scores: array-like, shape (n_examples, n_classes)
-        Scores/class probabilities of each example.
-      groups: array-like, shape (n_examples,)
-        Group label (zero-indexed) of each example; the sensitive attribute.
-      alpha: float, optional
-        Relaxation of DP constraint.  Specifies desired DP gap from 
-        post-processing.  Default is 0 (exact DP).
-      group_weight: array-like, shape (n_groups,), optional
-        Weight of each group for weighting classification error (need not be
-        normalized).  Default is empirical distribution of groups.
-      sample_weight: array-like, shape (n_examples,), optional
-        Weight of each example (need not be normalized).  Default is uniform.
-      q_by_group: list of array-like, shape (n_classes,), optional
-        Specify desired distributions of class assignments of each group.
+  def __init__(self,
+               n_classes: int,
+               n_groups: int,
+               pred_a_fn: Optional[Callable] = None,
+               pred_y_fn: Optional[Callable] = None,
+               pred_ay_fn: Optional[Callable] = None,
+               criterion: str = 'sp',
+               alpha: float = 0.001,
+               noise: float = 1e-4,
+               seed: Optional[int] = None) -> None:
     """
-    scores, groups = check_X_y(scores, groups)
-    if sample_weight is not None:
-      _, r = check_X_y(scores, sample_weight)
-    else:
-      r = None
+    Initialize the post-processor.
 
-    self.n_classes_ = scores.shape[-1]
-    self.n_groups_ = int(1 + np.max(groups))
-    self.alpha_ = alpha
-    if group_weight is None:
-      w = np.bincount(groups, minlength=self.n_groups_) / len(groups)
-    else:
-      w = group_weight
-    self.w_ = w
-
-    scores_by_group = [scores[groups == a] for a in range(self.n_groups_)]
-    # self.scores_by_group_ = scores_by_group  # for debugging
-    r_by_group = []
-    for a in range(self.n_groups_):
-      if r is not None:
-        this_r = r[groups == a]
-        # Upscale to prevent underflow
-        this_r *= len(this_r) / this_r.sum()
-        r_by_group.append(this_r)
-      else:
-        r_by_group.append(np.ones((groups == a).sum()))
-    total_r_max = max(len(r) for r in r_by_group)
-
-    problem = self.linprog_dp_(scores_by_group,
-                               alpha=alpha,
-                               w=w,
-                               r_by_group=r_by_group,
-                               q_by_group=q_by_group)
-    problem.solve(solver=cp.CBC, integerTolerance=tol)
-
-    # Downscale, due to the upscaling to `r_by_group` above
-    self.score_ = problem.value / total_r_max
-    self.q_by_group_ = problem.var_dict["q"].value
-    self.gamma_by_group_ = [
-        problem.var_dict[f'gamma_{a}'].value for a in range(self.n_groups_)
-    ]
-
-    psi_by_group = []
-    for a in range(self.n_groups_):
-      try:
-        problem = self.quadprog_find_point_(scores_by_group[a],
-                                            self.gamma_by_group_[a],
-                                            tol=tol)
-        problem.solve(solver=cp.OSQP)
-        z = problem.var_dict["z"].value
-        if z is None:
-          raise cp.error.SolverError
-        psi_by_group.append(
-            [0] + [2 * (z[0] - z[j]) for j in range(1, self.n_classes_)])
-      except cp.error.SolverError:
-        # Occurs if OSQP fails to converge, or `gamma_by_group_` is not optimal.
-        # Fall back to an alternative linear program formulation.
-        problem = self.linprog_score_transform_(scores_by_group[a],
-                                                self.gamma_by_group_[a],
-                                                tol=tol)
-        problem.solve(solver=cp.CBC, integerTolerance=tol)
-        psi_by_group.append(2 * problem.var_dict["bias"].value)
-    self.psi_by_group_ = np.stack(psi_by_group)
-
-    return self
-
-  def linprog_dp_(self,
-                  scores_by_group,
-                  alpha,
-                  w=None,
-                  r_by_group=None,
-                  q_by_group=None):
-    """This implements the LP in the paper (Line 3 of Algorithm 2)."""
-
-    alpha = cp.Parameter(value=alpha, name="alpha")
-
-    # Variables are the probability mass of the couplings, the barycenter,
-    # the output distributions, and slacks
-    gamma_by_group = [
-        cp.Variable(scores_by_group[a].shape, name=f"gamma_{a}")
-        for a in range(self.n_groups_)
-    ]
-    barycenter = cp.Variable(self.n_classes_, name="barycenter")
-    q = cp.Variable((self.n_groups_, self.n_classes_), name="q")
-    slack = cp.Variable((self.n_groups_, self.n_classes_), name="slack")
-
-    total_r = np.array([r.sum() for r in r_by_group])
-
-    # Get l1 transportation costs
-    # Upscale to prevent underflow, avoid numerical issues, and improve run time
-    cost_by_group = [
-        (1 - scores_by_group[a]) * w[a] * total_r.max() / total_r[a] / w.sum()
-        for a in range(self.n_groups_)
-    ]
-    cost = sum([
-        cp.sum(cp.multiply(gamma_by_group[a], cost_by_group[a]))
-        for a in range(self.n_groups_)
-    ])
-
-    # Build constraints
-    constraints = []
-
-    # \sum_y \gamma_{a, s, y} = r_{a, s}
-    for a in range(self.n_groups_):
-      constraints.append(cp.sum(gamma_by_group[a], axis=1) == r_by_group[a])
-
-    # \sum_s \gamma_{a, s, y} = q_{a, y}
-    for a in range(self.n_groups_):
-      constraints.append(cp.sum(gamma_by_group[a], axis=0) == q[a] * total_r[a])
-
-    # -\xi_{a, y} <= q_{a, y} - barycenter_{y} <= \xi_{a, y}
-    if q_by_group is None:
-      for a in range(self.n_groups_):
-        constraints.append(-slack[a] <= q[a] - barycenter)
-        constraints.append(q[a] - barycenter <= slack[a])
-    else:
-      q_by_group = cp.Parameter((self.n_groups_, self.n_classes_),
-                                value=q_by_group,
-                                name="q_by_group")
-      for a in range(self.n_groups_):
-        constraints.append(-slack[a] <= q[a] - q_by_group[a])
-        constraints.append(q[a] - q_by_group[a] <= slack[a])
-
-    # \xi_{a, y} <= \alpha / 2
-    constraints.append(slack <= alpha / 2)
-
-    # All variables are nonnegative
-    constraints.extend([gamma >= 0 for gamma in gamma_by_group])
-    constraints.append(q >= 0)
-    constraints.append(barycenter >= 0)
-    constraints.append(slack >= 0)
-
-    return cp.Problem(cp.Minimize(cost), constraints)
-
-  def quadprog_find_point_(self, scores, gamma, tol=1e-8):
-    """Extract post-processing map from LP solution (Lines 6-9 of Alg. 2)."""
-
-    z = cp.Variable(self.n_classes_, name="z")
-
-    # Compute boundaries that defines the convex polytope
-    boundaries = np.zeros((self.n_classes_, self.n_classes_))
-    for i in range(self.n_classes_):
-      for j in chain(range(i), range(i + 1, self.n_classes_)):
-        idx = gamma[:, i] > tol  # or ~np.isclose(gamma[:, i], 0)?
-        boundaries[i, j] = np.max(scores[idx, j] - scores[idx, i] + 1,
-                                  initial=0)
-    boundaries -= np.clip(boundaries + boundaries.T - 2, 0,
-                          None) / 2  # in case of numerical issues
-    gaps = np.clip((2 - boundaries.T - boundaries), 1e-2, None)
-
-    # Get cost and build constraints
-    cost = 0
-    constraints = []
-    for i in range(self.n_classes_):
-      for j in chain(range(i), range(i + 1, self.n_classes_)):
-        # z_j - z_i >= B_ij - 1
-        constraints.append(z[j] - z[i] >= boundaries[i, j] - 1)
-        cost += cp.square(z[j] - z[i] - (boundaries[i, j] - 1)) / gaps[i, j]**2
-    return cp.Problem(cp.Minimize(cost), constraints)
-
-  def linprog_score_transform_(self, scores, gamma, tol=1e-8):
-    """Extract post-processing map from LP solution (Lines 6-9 of Alg. 2)."""
-
-    diffs = defaultdict(dict)
-    for s, g in zip(scores, gamma):
-      candidates = set(np.where(g > tol)[0])  # or use np.isclose?
-      for i in candidates:
-        for j in chain(range(i), range(i + 1, self.n_classes_)):
-          # b_i + s_i >= b_j + s_j <==> b_i - b_j >= s_j - s_i
-          d = s[j] - s[i]
-          new_d = d if j not in diffs[i] else max(d, diffs[i][j])
-          diffs[i][j] = new_d
-
-    # Slack variables for handling numerical issues
-    bias = cp.Variable(self.n_classes_, name="bias")
-    slack = cp.Variable((self.n_classes_, self.n_classes_), name="slack")
-    constraints = [slack >= 0]
-    for i in diffs:
-      for j in diffs[i]:
-        constraints.append(bias[i] + slack[i][j] >= bias[j] + diffs[i][j])
-    return cp.Problem(cp.Minimize(cp.sum(slack)), constraints)
-
-  def predict(self, scores, groups):
-    """Output DP fair class assignments given scores.
+    For `eo` and `eopp` criteria, a predictor for A and Y given X is required.
+    Output shape of `pred_ay_fn` should be (batch_size, n_groups, n_classes),
+    or (batch_size, n_groups * n_classes) if flattened (unraveled).
 
     Args:
-      scores: array-like, shape (n_examples, n_classes)
-        Scores/class probabilities of each example.
-      groups: array-like, shape (n_examples,)
-        Group label (zero-indexed) of each example; the sensitive attribute.
+      n_classes (int): Number of classes.
+      n_groups (int): Number of categories for the sensitive attribute A.
+      pred_a_fn (function, optional): Function to predict A given X.
+      pred_y_fn (function, optional): Function to predict Y given X.
+      pred_ay_fn (function, optional): Function to predict A and Y given X.
+      criterion (str, optional): Fairness criterion.
+          `sp` for statistical parity, `eopp` for (binary or multi-class) equal
+          opportunity (depending on `n_classes`), and `eo` for equalized odds.
+      alpha (float, optional): Fairness tolerance.
+      noise (float, optional): Factor for the width of uniform random noise used
+          to perturb the loss.
+      seed (int, optional): Seed for random number generator.
+    """
+    self.n_classes = n_classes
+    self.n_groups = n_groups
+    self.pred_a_fn = pred_a_fn
+    self.pred_y_fn = pred_y_fn
+    self.pred_ay_fn = pred_ay_fn
+    self.criterion = criterion
+    self.alpha = alpha
+    self.noise = noise
+    self.rng = np.random.default_rng(seed)
+    self.cls_loss_fn = 1 - np.eye(n_classes)
+
+    if criterion not in ['sp', 'eopp', 'eo']:
+      raise ValueError("criterion must be one of `sp`, `eopp`, `eo`")
+    if criterion == 'sp' and (pred_ay_fn is None and
+                              (pred_a_fn is None or pred_y_fn is None)):
+      raise ValueError(
+          '(pred_a_fn and pred_y_fn) or pred_ay_fn must be provided for `sp` criterion'
+      )
+    if criterion in ['eopp', 'eo'] and pred_ay_fn is None:
+      raise ValueError(
+          'pred_ay_fn must be provided for `eopp` or `eo` criterion')
+
+  # TODO: sample weight
+  def fit(self,
+          x: np.ndarray,
+          solver: str = cp.GUROBI,
+          solve_kwargs: Optional[Dict[str, Any]] = None,
+          solve_primal: bool = True) -> Self:
+    """
+    Fit the post-processor.
+
+    Args:
+      x (array-like): Input data.
+      solver (str, optional): LP solver from `cvxpy` to use.
+      solve_kwargs (dict, optional): Keyword arguments for the solver.
+      solve_primal (bool, optional): Whether to solve the primal problem.
+
+    If Gurobi is not available, a (slower) alternative is
+    `solver=cp.CBC, solve_kwargs={'integerTolerance': 1e-8}, solve_primal=False`
+
+    There are two ways to solve for the parameters of the post-processor, (1)
+    solve the primal problem and extract the dual values (solve_primal=True), or
+    (2) solve the dual problem directly (solve_primal=False).  The former is
+    usually faster, but not all solvers support it (e.g., CBC).
 
     Returns:
-      array-like, shape (n_examples,)
-      Fair class assignments (zero-indexed) of each example.
+      self: Returns an instance of the PostProcessor object.
     """
-    scores = check_array(scores)
-    groups = check_array(groups, ensure_2d=False)
-    scores, groups = check_X_y(scores, groups)
-    check_is_fitted(self, "psi_by_group_")
-    # argmin(2 * (1 - s) - \psi) = argmin(-2s - \psi) = argmax(2s + \psi)
-    return np.argmin(-2 * scores - self.psi_by_group_[groups], axis=1)
+    solve_kwargs = solve_kwargs or {}
+
+    (loss, constraint_gamma, constraint_y, p_a,
+     p_ay) = self.compute_loss_and_constraint_(x)
+
+    # Perturb loss to circumvent colinearity
+    self.loss_mean_ = np.mean(loss)
+    loss += self.loss_mean_ * self.rng.uniform(
+        -self.noise, self.noise, size=loss.shape)
+
+    if solve_primal:
+      problem = self.linprog_primal_(loss, constraint_gamma, constraint_y,
+                                     self.alpha)
+      problem.solve(solver=solver, **solve_kwargs)
+      n_constraints = constraint_gamma.shape[1]
+      self.psi_ = (np.array([
+          c.dual_value for c in problem.constraints[-2 * n_constraints::2]
+      ]) - np.array([
+          c.dual_value for c in problem.constraints[-2 * n_constraints + 1::2]
+      ]))
+      self.phi_ = -problem.constraints[0].dual_value
+      self.pi_ = problem.var_dict['pi'].value
+    else:
+      problem = self.linprog_dual_(loss, constraint_gamma, constraint_y,
+                                   self.alpha)
+      problem.solve(solver=solver, **solve_kwargs)
+      self.psi_ = problem.var_dict['psi_pos'].value - problem.var_dict[
+          'psi_neg'].value
+      self.phi_ = problem.var_dict['phi'].value
+
+    # TODO: catch situations where the solver fails (i.e., numerical issues)
+
+    self.score_ = problem.value
+    self.loss_ = loss  # for debugging
+    self.constraint_gamma_ = constraint_gamma
+    self.p_a_ = p_a
+    self.p_ay_ = p_ay
+    return self
+
+  def predict(self, x: np.ndarray) -> np.ndarray:
+    """
+    Make fair predictions for the input data.
+
+    Args:
+      x (array-like): Input data.
+
+    Returns:
+      array-like: Predicted class labels.
+    """
+    loss, constraint_gamma, constraint_y, _, _ = self.compute_loss_and_constraint_(
+        x, self.p_a_, self.p_ay_)
+
+    # Perturb loss to circumvent colinearity
+    loss += self.loss_mean_ * self.rng.uniform(
+        -self.noise, self.noise, size=loss.shape)
+
+    mask_y = np.where(
+        constraint_y[None, :] == np.arange(self.n_classes)[:, None], 1, 0)
+    fair_cost = np.sum(
+        np.sum(self.psi_ * constraint_gamma, axis=-1)[:, None, :] *
+        mask_y[None, :, :],
+        axis=-1)  # shape = (n_examples, n_classes)
+
+    fair_loss = loss - fair_cost
+    return np.argmin(fair_loss, axis=1)
+
+  def compute_loss_and_constraint_(
+      self,
+      x: np.ndarray,
+      p_a: Optional[np.ndarray] = None,
+      p_ay: Optional[np.ndarray] = None
+  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute the loss and constraints from the input data. Required for fitting
+    and prediction.
+
+    Args:
+      x (array-like): Input data.
+      p_a (array-like, optional): Probabilities of A given X.
+      p_ay (array-like, optional): Probabilities of A and Y given X.
+
+    Returns:
+      tuple: Tuple containing loss, constraint_gamma, constraint_y, p_a, and p_ay.
+    """
+    # mask.shape = (n_classes, n_constraints)
+    # loss.shape = (n_examples, n_classes)
+    # gamma.shape = (n_examples, n_constraints, n_events)
+
+    if self.criterion == 'sp':
+
+      # Get predicted p(A | X) and p(Y | X)
+      if self.pred_ay_fn is not None:
+        p_ay_x = self.pred_ay_fn(x).reshape(-1, self.n_groups, self.n_classes)
+        p_a_x = p_ay_x.sum(axis=2)
+        p_y_x = p_ay_x.sum(axis=1)
+      else:
+        p_a_x = self.pred_a_fn(x)
+        p_y_x = self.pred_y_fn(x)
+
+      if p_a is None:
+        p_a = p_a_x.mean(axis=0)  # shape = (n_groups,)
+
+      constraint_y = np.arange(self.n_classes)
+      constraint_gamma = np.repeat((p_a_x / p_a)[:, None, :],
+                                   self.n_classes,
+                                   axis=1)
+
+    if self.criterion in ['eopp', 'eo']:
+
+      p_ay_x = self.pred_ay_fn(x).reshape(
+          -1, self.n_groups,
+          self.n_classes)  # shape = (n_examples, n_groups, n_classes)
+      p_y_x = p_ay_x.sum(axis=1)  # shape = (n_examples, n_classes)
+
+      if p_ay is None:
+        p_ay = p_ay_x.mean(axis=0)  # shape = (n_groups, n_classes)
+
+      constraint_y = []
+      constraint_gamma = []
+      for y_ in range(self.n_classes):
+        for y in range(self.n_classes):
+          if self.criterion == 'eopp' and (y != y_ or
+                                           (self.n_classes == 2 and y == 0)):
+            continue
+          constraint_y.append(y_)
+          constraint_gamma.append(p_ay_x[:, :, y] / p_ay[:, y])
+      constraint_y = np.array(constraint_y)
+      constraint_gamma = np.array(constraint_gamma).transpose(1, 0, 2)
+
+    loss = np.sum(p_y_x[:, :, None] * self.cls_loss_fn[None, :],
+                  axis=1)  # shape = (n_examples, n_classes)
+
+    return loss, constraint_gamma, constraint_y, p_a, p_ay
+
+  def linprog_primal_(self, loss: np.ndarray, constraint_gamma: np.ndarray,
+                      constraint_y: np.ndarray, alpha: float) -> cp.Problem:
+    """
+    Solve the fair classification problem in primal LP formulation.
+
+    Args:
+      loss (array-like): Loss values.
+      constraint_gamma (array-like): Constraint function values.
+      constraint_y (array-like): Classes to be constrained.
+      alpha (float): Fairness tolerance.
+
+    Returns:
+      cp.Problem: Linear programming problem.
+    """
+    n_examples = loss.shape[0]
+    n_constraints = constraint_gamma.shape[1]
+
+    alpha = cp.Parameter(value=alpha, name="alpha")
+    pi = cp.Variable((n_examples, self.n_classes), name="pi", nonneg=True)
+    q = cp.Variable(n_constraints, name="q", nonneg=True)
+
+    # Get constraints
+    constraints = []
+
+    # \sum_y \pi(y | x) = 1, for all x
+    constraints.append(cp.sum(pi, axis=1) == 1)
+
+    # | \sum_x \gamma_{i, j}(x) * \pi(y_i | x) * p(x) - q_i | <= \alpha / 2, for all i, j
+    for i in range(n_constraints):
+      t = cp.sum(cp.multiply(constraint_gamma[:, i],
+                             pi[:, constraint_y[i]][:, None]),
+                 axis=0)
+      constraints.append(-alpha * n_examples / 2 <= t - q[i] * n_examples)
+      constraints.append(t - q[i] * n_examples <= alpha * n_examples / 2)
+
+    return cp.Problem(cp.Minimize(cp.sum(cp.multiply(pi, loss))), constraints)
+
+  def linprog_dual_(self, loss: np.ndarray, constraint_gamma: np.ndarray,
+                    constraint_y: np.ndarray, alpha: float) -> cp.Problem:
+    """
+    Solve the fair classification problem in dual LP formulation.
+
+    Args:
+      loss (array-like): Loss values.
+      constraint_gamma (array-like): Constraint function values.
+      constraint_y (array-like): Classes to be constrained.
+      alpha (float): Fairness tolerance.
+
+    Returns:
+      cp.Problem: Linear programming problem.
+    """
+    n_examples = loss.shape[0]
+    n_classes = loss.shape[1]
+    n_constraints = constraint_gamma.shape[1]
+
+    alpha = cp.Parameter(value=alpha, name="alpha")
+    phi = cp.Variable(loss.shape[0], name="phi")
+    psi_pos = cp.Variable(
+        (constraint_gamma.shape[1], constraint_gamma.shape[2]),
+        name="psi_pos",
+        nonneg=True)
+    psi_neg = cp.Variable(
+        (constraint_gamma.shape[1], constraint_gamma.shape[2]),
+        name="psi_neg",
+        nonneg=True)
+
+    # Get constraints
+    constraints = []
+
+    # \sum_j \psi_pos_{i, j} - \psi_neg_{i, j} >= 0, for all i (*)
+    constraints.append(cp.sum(psi_pos - psi_neg, axis=1) == 0)
+
+    # \phi(x) + \sum_ij 1[y_i = y] * (\psi_pos_{i, j} - \psi_neg_{i, j}) * \gamma_{i, j}(x)
+    #     <= \loss(x, y), for all x, y
+    t = [0 for _ in range(n_classes)]
+    for i in range(n_constraints):
+      t[constraint_y[i]] += cp.sum(cp.multiply(
+          constraint_gamma[:, i, :], (psi_pos[i, :] - psi_neg[i, :])[None, :]),
+                                   axis=1)
+    t = cp.vstack(t).T
+    constraints.append(phi[:, None] + t <= loss)
+
+    # Note that \sum_j \psi_pos_{i, j} = \sum_j \psi_neg_{i, j} because of the constraint (*)
+    return cp.Problem(
+        cp.Maximize(cp.sum(phi) - alpha * cp.sum(psi_pos) * n_examples),
+        constraints)
