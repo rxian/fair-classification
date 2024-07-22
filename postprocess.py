@@ -295,7 +295,7 @@ class PostProcessor:
     # Get constraints
     constraints = []
 
-    # \sum_j \psi_pos_{i, j} - \psi_neg_{i, j} >= 0, for all i (*)
+    # \sum_j \psi_pos_{i, j} - \psi_neg_{i, j} = 0, for all i (*)
     constraints.append(cp.sum(psi_pos - psi_neg, axis=1) == 0)
 
     # \phi(x) + \sum_ij 1[y_i = y] * (\psi_pos_{i, j} - \psi_neg_{i, j}) * \gamma_{i, j}(x)
@@ -305,10 +305,11 @@ class PostProcessor:
       t[constraint_y[i]] += cp.sum(cp.multiply(
           constraint_gamma[:, i, :], (psi_pos[i, :] - psi_neg[i, :])[None, :]),
                                    axis=1)
-    t = cp.vstack(t).T
-    constraints.append(phi[:, None] + t <= loss)
+    # constraints.append(phi[:, None] + t <= loss)
+    for y, s in enumerate(t):
+      constraints.append(phi + s <= loss[:, y])
 
-    # Note that \sum_j \psi_pos_{i, j} = \sum_j \psi_neg_{i, j} because of the constraint (*)
+    # Note that \sum_j \psi_pos_{i, j} = \sum_j \psi_neg_{i, j} because of the constraint (*), so `/ 2` is removed
     return cp.Problem(
         cp.Maximize(cp.sum(phi) - alpha * cp.sum(psi_pos) * n_examples),
         constraints)
