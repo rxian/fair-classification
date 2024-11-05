@@ -5,28 +5,41 @@ import sklearn, sklearn.cluster
 
 class BinningCalibrator:
 
-  def __init__(self, n_bins=None, binning_fn=None, random_state=None):
+  def __init__(self,
+               n_bins=None,
+               binning_fn=None,
+               prior_strength=0,
+               random_state=None):
     self.n_bins = n_bins
     self.binning_fn_ = binning_fn
+    self.prior_strength = prior_strength
     self.random_state = random_state
 
   def fit(self, P, y):
     if self.binning_fn_ is None:
       binning = sklearn.cluster.KMeans(n_clusters=self.n_bins,
-                                       n_init=1,
+                                       n_init='auto',
                                        random_state=self.random_state)
       bins = binning.fit_predict(P)
       self.binning_fn_ = binning.predict
     else:
       bins = self.binning_fn_(P)
+    self.bin_counts_ = []
+    self.bin_vals_true_ = []
+    self.bin_vals_model_ = []
     self.bin_vals_ = []
     self.score_ = 0
     for b in range(np.max(bins) + 1):
       mask = bins == b
       p = np.bincount(y[mask], minlength=P.shape[1])
-      self.bin_vals_.append(p / mask.sum(axis=0))
-      true_p = self.bin_vals_[-1]
+      true_p = p / mask.sum(axis=0)
+      self.bin_vals_true_.append(true_p)
       model_p = P[mask].mean(axis=0)
+      self.bin_vals_model_.append(model_p)
+      counts = mask.sum()
+      self.bin_counts_.append(counts)
+      self.bin_vals_.append((true_p * counts + model_p * self.prior_strength) /
+                            (counts + self.prior_strength))
       self.score_ += np.sum(np.abs(true_p - model_p)) * mask.sum() / len(y)
     return self
 

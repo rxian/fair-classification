@@ -10,7 +10,7 @@ import cvxpy as cp
 class PostProcessor:
   """
   A post-processor on top of pre-trained predictors for achieving fair
-  classification (0-1 loss).
+  classification (maximizing for classification accuracy).
   """
 
   def __init__(self,
@@ -41,7 +41,7 @@ class PostProcessor:
           opportunity (depending on `n_classes`), and `eo` for equalized odds.
       alpha (float, optional): Fairness tolerance.
       noise (float, optional): Factor for the width of uniform random noise used
-          to perturb the loss.
+          to perturb the risk.
       seed (int, optional): Seed for random number generator.
     """
     self.n_classes = n_classes
@@ -94,16 +94,16 @@ class PostProcessor:
     """
     solve_kwargs = solve_kwargs or {}
 
-    (loss, constraint_gamma, constraint_y, p_a,
-     p_ay) = self.compute_loss_and_constraint_(x)
+    (risk, constraint_gamma, constraint_y, p_a,
+     p_ay) = self.compute_risk_and_constraint_(x)
 
-    # Perturb loss to circumvent colinearity
-    self.loss_mean_ = np.mean(loss)
-    loss += self.loss_mean_ * self.rng.uniform(
-        -self.noise, self.noise, size=loss.shape)
+    # Perturb risk to circumvent colinearity
+    self.risk_mean_ = np.mean(risk)
+    risk += self.risk_mean_ * self.rng.uniform(
+        -self.noise, self.noise, size=risk.shape)
 
     if solve_primal:
-      problem = self.linprog_primal_(loss, constraint_gamma, constraint_y,
+      problem = self.linprog_primal_(risk, constraint_gamma, constraint_y,
                                      self.alpha)
       problem.solve(solver=solver, **solve_kwargs)
       n_constraints = constraint_gamma.shape[1]
@@ -115,7 +115,7 @@ class PostProcessor:
       self.phi_ = -problem.constraints[0].dual_value
       self.pi_ = problem.var_dict['pi'].value
     else:
-      problem = self.linprog_dual_(loss, constraint_gamma, constraint_y,
+      problem = self.linprog_dual_(risk, constraint_gamma, constraint_y,
                                    self.alpha)
       problem.solve(solver=solver, **solve_kwargs)
       self.psi_ = problem.var_dict['psi_pos'].value - problem.var_dict[
@@ -125,11 +125,38 @@ class PostProcessor:
     # TODO: catch situations where the solver fails (i.e., numerical issues)
 
     self.score_ = problem.value
-    self.loss_ = loss  # for debugging
+    self.risk_ = risk  # for debugging
     self.constraint_gamma_ = constraint_gamma
     self.p_a_ = p_a
     self.p_ay_ = p_ay
     return self
+
+  def predict_score(self, x: np.ndarray) -> np.ndarray:
+    """
+    Post-process the riskes of the input data by adding the cost of fairness.
+
+    Args:
+      x (array-like): Input data.
+
+    Returns:
+      array-like: Post-processed risk values.
+    """
+    risk, constraint_gamma, constraint_y, _, _ = self.compute_risk_and_constraint_(
+        x, self.p_a_, self.p_ay_)
+
+    # Perturb risk to circumvent colinearity
+    risk += self.risk_mean_ * self.rng.uniform(
+        -self.noise, self.noise, size=risk.shape)
+
+    mask_y = np.where(
+        constraint_y[None, :] == np.arange(self.n_classes)[:, None], 1, 0)
+    fair_cost = np.sum(
+        np.sum(self.psi_ * constraint_gamma, axis=-1)[:, None, :] *
+        mask_y[None, :, :],
+        axis=-1)  # shape = (n_examples, n_classes)
+
+    fair_risk = risk - fair_cost
+    return fair_risk
 
   def predict(self, x: np.ndarray) -> np.ndarray:
     """
@@ -141,31 +168,17 @@ class PostProcessor:
     Returns:
       array-like: Predicted class labels.
     """
-    loss, constraint_gamma, constraint_y, _, _ = self.compute_loss_and_constraint_(
-        x, self.p_a_, self.p_ay_)
+    fair_risk = self.predict_score(x)
+    return np.argmin(fair_risk, axis=1)
 
-    # Perturb loss to circumvent colinearity
-    loss += self.loss_mean_ * self.rng.uniform(
-        -self.noise, self.noise, size=loss.shape)
-
-    mask_y = np.where(
-        constraint_y[None, :] == np.arange(self.n_classes)[:, None], 1, 0)
-    fair_cost = np.sum(
-        np.sum(self.psi_ * constraint_gamma, axis=-1)[:, None, :] *
-        mask_y[None, :, :],
-        axis=-1)  # shape = (n_examples, n_classes)
-
-    fair_loss = loss - fair_cost
-    return np.argmin(fair_loss, axis=1)
-
-  def compute_loss_and_constraint_(
+  def compute_risk_and_constraint_(
       self,
       x: np.ndarray,
       p_a: Optional[np.ndarray] = None,
       p_ay: Optional[np.ndarray] = None
   ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Compute the loss and constraints from the input data. Required for fitting
+    Compute the risk and constraints from the input data. Required for fitting
     and prediction.
 
     Args:
@@ -174,10 +187,10 @@ class PostProcessor:
       p_ay (array-like, optional): Probabilities of A and Y given X.
 
     Returns:
-      tuple: Tuple containing loss, constraint_gamma, constraint_y, p_a, and p_ay.
+      tuple: Tuple containing risk, constraint_gamma, constraint_y, p_a, and p_ay.
     """
     # mask.shape = (n_classes, n_constraints)
-    # loss.shape = (n_examples, n_classes)
+    # risk.shape = (n_examples, n_classes)
     # gamma.shape = (n_examples, n_constraints, n_events)
 
     if self.criterion == 'sp':
@@ -221,18 +234,18 @@ class PostProcessor:
       constraint_y = np.array(constraint_y)
       constraint_gamma = np.array(constraint_gamma).transpose(1, 0, 2)
 
-    loss = np.sum(p_y_x[:, :, None] * self.cls_loss_fn[None, :],
+    risk = np.sum(p_y_x[:, :, None] * self.cls_loss_fn[None, :],
                   axis=1)  # shape = (n_examples, n_classes)
 
-    return loss, constraint_gamma, constraint_y, p_a, p_ay
+    return risk, constraint_gamma, constraint_y, p_a, p_ay
 
-  def linprog_primal_(self, loss: np.ndarray, constraint_gamma: np.ndarray,
+  def linprog_primal_(self, risk: np.ndarray, constraint_gamma: np.ndarray,
                       constraint_y: np.ndarray, alpha: float) -> cp.Problem:
     """
     Solve the fair classification problem in primal LP formulation.
 
     Args:
-      loss (array-like): Loss values.
+      risk (array-like): Risk values.
       constraint_gamma (array-like): Constraint function values.
       constraint_y (array-like): Classes to be constrained.
       alpha (float): Fairness tolerance.
@@ -240,7 +253,7 @@ class PostProcessor:
     Returns:
       cp.Problem: Linear programming problem.
     """
-    n_examples = loss.shape[0]
+    n_examples = risk.shape[0]
     n_constraints = constraint_gamma.shape[1]
 
     alpha = cp.Parameter(value=alpha, name="alpha")
@@ -261,15 +274,15 @@ class PostProcessor:
       constraints.append(-alpha * n_examples / 2 <= t - q[i] * n_examples)
       constraints.append(t - q[i] * n_examples <= alpha * n_examples / 2)
 
-    return cp.Problem(cp.Minimize(cp.sum(cp.multiply(pi, loss))), constraints)
+    return cp.Problem(cp.Minimize(cp.sum(cp.multiply(pi, risk))), constraints)
 
-  def linprog_dual_(self, loss: np.ndarray, constraint_gamma: np.ndarray,
+  def linprog_dual_(self, risk: np.ndarray, constraint_gamma: np.ndarray,
                     constraint_y: np.ndarray, alpha: float) -> cp.Problem:
     """
     Solve the fair classification problem in dual LP formulation.
 
     Args:
-      loss (array-like): Loss values.
+      risk (array-like): Risk values.
       constraint_gamma (array-like): Constraint function values.
       constraint_y (array-like): Classes to be constrained.
       alpha (float): Fairness tolerance.
@@ -277,12 +290,12 @@ class PostProcessor:
     Returns:
       cp.Problem: Linear programming problem.
     """
-    n_examples = loss.shape[0]
-    n_classes = loss.shape[1]
+    n_examples = risk.shape[0]
+    n_classes = risk.shape[1]
     n_constraints = constraint_gamma.shape[1]
 
     alpha = cp.Parameter(value=alpha, name="alpha")
-    phi = cp.Variable(loss.shape[0], name="phi")
+    phi = cp.Variable(risk.shape[0], name="phi")
     psi_pos = cp.Variable(
         (constraint_gamma.shape[1], constraint_gamma.shape[2]),
         name="psi_pos",
@@ -299,17 +312,17 @@ class PostProcessor:
     constraints.append(cp.sum(psi_pos - psi_neg, axis=1) == 0)
 
     # \phi(x) + \sum_ij 1[y_i = y] * (\psi_pos_{i, j} - \psi_neg_{i, j}) * \gamma_{i, j}(x)
-    #     <= \loss(x, y), for all x, y
+    #     <= \risk(x, y), for all x, y
     t = [0 for _ in range(n_classes)]
     for i in range(n_constraints):
       t[constraint_y[i]] += cp.sum(cp.multiply(
           constraint_gamma[:, i, :], (psi_pos[i, :] - psi_neg[i, :])[None, :]),
                                    axis=1)
-    # constraints.append(phi[:, None] + t <= loss)
+    # constraints.append(phi[:, None] + t <= risk)
     for y, s in enumerate(t):
-      constraints.append(phi + s <= loss[:, y])
+      constraints.append(phi + s <= risk[:, y])
 
-    # Note that \sum_j \psi_pos_{i, j} = \sum_j \psi_neg_{i, j} because of the constraint (*), so `/ 2` is removed
+    # Note that \sum_j \psi_pos_{i, j} = \sum_j \psi_neg_{i, j} because of constraint (*), so `/ 2` is removed
     return cp.Problem(
         cp.Maximize(cp.sum(phi) - alpha * cp.sum(psi_pos) * n_examples),
         constraints)

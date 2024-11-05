@@ -4,7 +4,10 @@ import traceback
 import numpy as np
 import pandas as pd
 import sklearn.metrics
-from tqdm.contrib.concurrent import process_map
+import tqdm
+
+from joblib import Parallel, delayed
+# from tqdm.contrib.concurrent import process_map
 
 from models import BinningCalibrator
 import postprocess
@@ -85,14 +88,16 @@ def delta_eopp(y_true, y_preds, groups, n_classes, n_groups, ord=np.inf):
   return np.max(diffs)
 
 
-def calibration_error(probas, labels, n_bins):
-  """See calibration corollary of (Xian et al., 2024)."""
-  calibrator = BinningCalibrator(n_bins=n_bins).fit(probas, labels)
-  # bins = calibrator.binning_fn_(probas)
+def calibration_error(probas, labels, n_bins, seed=0):
+  """Computes binned expected calibration error, with bins selected by k-means.
+  """
+  calib = BinningCalibrator(n_bins=n_bins,
+                            random_state=seed).fit(probas, labels)
+  # bins = calib.binning_fn_(probas)
   # bin_to_proba = {b: probas[bins == b].mean(axis=0) for b in np.unique(bins)}
   # probas_binned = np.array([bin_to_proba[b] for b in bins])
   p = np.mean(probas, axis=0)
-  probas_cal = calibrator.predict_proba(probas)
+  probas_cal = calib.predict_proba(probas)
   p_cal = np.mean(probas_cal, axis=0)
   return np.max(np.mean(np.abs(probas / p - probas_cal / p_cal), axis=0))
 
@@ -112,9 +117,16 @@ def postprocess_and_evaluate(alphas,
                              probas_y=None,
                              probas_a=None,
                              probas_ay=None,
+                             calibrator_factory=None,
                              max_workers=1,
+                             postproc_kwargs=None,
+                             return_vals=False,
                              print_code=False):
+
   ## This wrapper is for our algorithm defined in postprocess.PostProcessor
+
+  if postproc_kwargs is None:
+    postproc_kwargs = {}
 
   if print_code:
     if probas_ay is not None:
@@ -160,26 +172,42 @@ def postprocess_and_evaluate(alphas,
       probas_y=probas_y,
       probas_a=probas_a,
       probas_ay=probas_ay,
+      calibrator_factory=calibrator_factory,
   )
 
   if max_workers == 1:
-    return_vals = []
+    res = []
     for alpha in alphas:
       for seed in seeds:
-        return_vals.append(fn((alpha, seed)))
-        # print(return_vals[-1])  # to monitor progress
+        res.append(fn((alpha, seed, postproc_kwargs)))
+        # print(res[-1])  # to monitor progress
   else:
-    return_vals = process_map(
-        fn,
-        [(alpha, seed) for alpha in alphas for seed in seeds],
-        max_workers=max_workers,
-    )  # each val = (alpha, seed, metrics, postprocessor)
-  return pd.DataFrame([{
+
+    alpha_seed_and_kwargs = [
+        (alpha, seed, postproc_kwargs) for alpha in alphas for seed in seeds
+    ]
+
+    res = Parallel(n_jobs=max_workers)(
+        delayed(fn)(alpha_seed_and_kwargs[i])
+        for i in tqdm.tqdm(range(len(alpha_seed_and_kwargs))
+                          ))  # each val = (alpha, seed, metrics, postprocessor)
+
+    ## process_map does not work with sklearn
+    # res = process_map(
+    #     fn,
+    #     alpha_seed_and_kwargs,
+    #     max_workers=max_workers,
+    # )  # each val = (alpha, seed, metrics, postprocessor)
+
+  ret = pd.DataFrame([{
       'alpha': alpha,
       **result
-  } for alpha, _, result, _ in return_vals if result is not None
-                      ]).groupby('alpha').agg(['mean', np.std
-                                              ]).sort_index(ascending=False)
+  } for alpha, _, result, _ in res if result is not None
+                     ]).groupby('alpha').agg(['mean', np.std
+                                             ]).sort_index(ascending=False)
+  if return_vals:
+    return ret, res
+  return ret
 
 
 def dict_get_key(d, k):
@@ -198,6 +226,7 @@ def postprocess_and_evaluate_(
     probas_y=None,
     probas_a=None,
     probas_ay=None,
+    calibrator_factory=None,
 ):
 
   if len(alpha_seed_and_kwargs) == 2:
@@ -229,8 +258,21 @@ def postprocess_and_evaluate_(
   probas_postproc = {}
   probas_test = {}
   for n, p in zip(['y', 'a', 'ay'], [probas_y, probas_a, probas_ay]):
+    if n == 'y':
+      target = labels_postproc
+    elif n == 'a':
+      target = groups_postproc
+    else:
+      target = groups_postproc * n_classes + labels_postproc
     n = f'pred_{n}_fn'
     if p is not None:
+      if calibrator_factory is not None:
+        calib = calibrator_factory(random_state=seed)
+        # print(p[idx_postproc].reshape(len(idx_postproc), -1).shape)
+        # asfas
+        calib.fit(p[idx_postproc].reshape(len(idx_postproc), -1), target)
+        # dfasf
+        p = calib.predict_proba(p.reshape(len(p), -1)).reshape(p.shape)
       pred_fns[n] = partial(dict_get_key, k=n)
       probas_postproc[n] = p[idx_postproc]
       probas_test[n] = p[idx_test]
@@ -239,8 +281,10 @@ def postprocess_and_evaluate_(
     # Evaluate the unprocessed model
     postprocessor = None
     if probas_y is None:
-      probas_y = probas_ay.sum(axis=1)
-    preds_test = probas_y[idx_test].argmax(axis=1)
+      probas_test_ = probas_test['pred_ay_fn'].sum(axis=1)
+    else:
+      probas_test_ = probas_test['pred_y_fn']
+    preds_test = probas_test_.argmax(axis=1)
   else:
     try:
       # Post-process the predicted probabilities
@@ -309,18 +353,23 @@ def evaluate(test_labels,
           n_groups=n_groups,
           ord=2 if metric.endswith('rms') else np.inf,
       ) / (n_classes if metric.endswith('rms') else 1)
+    elif metric.startswith('dist'):
+      label = int(metric.split('_')[-1])
+      result[metric] = (test_preds == label).mean()
   return result
 
 
-def plot_results(ax, df, x_col, y_col, color=None, label=None):
+def plot_results(ax, df, x_col, y_col, label=None, **kwargs):
+  if 'fmt' not in kwargs:
+    kwargs['fmt'] = '-'
   markers, caps, bars = ax.errorbar(
       df[x_col]['mean'].values,
       df[y_col]['mean'].values,
       xerr=df[x_col]['std'].values,
       yerr=df[y_col]['std'].values,
-      fmt='o',
-      color=color,
+      lw=2,
       label=label,
+      **kwargs,
   )
   for b in bars:
     b.set_alpha(0.4)
